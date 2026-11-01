@@ -6,7 +6,7 @@ use super::{Connection, SentFrames, spaces::SentPacket};
 use crate::{
     ConnectionId, Instant, TransportError, TransportErrorCode,
     connection::ConnectionSide,
-    frame::{self, Close},
+    frame::{self, Close, FrameStruct},
     packet::{FIXED_BIT, Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId},
 };
 
@@ -31,7 +31,7 @@ impl PacketBuilder {
     /// Write a new packet header to `buffer` and determine the packet's properties
     ///
     /// Marks the connection drained and returns `None` if the confidentiality limit would be
-    /// violated.
+    /// violated, or an Initial token leaves insufficient space for frames.
     pub(super) fn new(
         now: Instant,
         space_id: SpaceId,
@@ -86,7 +86,11 @@ impl PacketBuilder {
 
         let span = trace_span!("send", space = ?space_id, pn = exact_number).entered();
 
-        let number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
+        let number = PacketNumber::new_with_min_len(
+            exact_number,
+            space.largest_acked_packet.unwrap_or(0),
+            conn.config.min_packet_number_len,
+        );
         let header = match space_id {
             SpaceId::Data if space.crypto.is_some() => Header::Short {
                 dst_cid,
@@ -103,7 +107,7 @@ impl PacketBuilder {
                 src_cid: conn.handshake_cid,
                 dst_cid,
                 number,
-                version,
+                version: conn.orig_version,
             },
             SpaceId::Handshake => Header::Long {
                 ty: LongType::Handshake,
@@ -123,8 +127,23 @@ impl PacketBuilder {
                 version,
             }),
         };
+        if let Some(flight) = conn
+            .sent_flight
+            .as_mut()
+            .filter(|_| conn.stats.udp_rx.datagrams == 0)
+        {
+            match &header {
+                Header::Initial(_) => flight.packets.push((exact_number, number.len() as u8)),
+                Header::Long {
+                    ty: LongType::ZeroRtt,
+                    ..
+                } => flight.zero_rtt = true,
+                _ => {}
+            }
+        }
         let partial_encode = header.encode(buffer);
-        if conn.peer_params.grease_quic_bit && conn.rng.random() {
+        if conn.peer_params.grease_quic_bit && conn.send_greased_quic_bit && conn.rng.random()
+        {
             buffer[partial_encode.start] ^= FIXED_BIT;
         }
 
@@ -152,7 +171,28 @@ impl PacketBuilder {
             buffer.len() + (sample_size + 4).saturating_sub(number.len() + tag_len),
             partial_encode.start + dst_cid.len() + 6,
         );
-        let max_size = buffer_capacity - tag_len;
+        let max_size = buffer_capacity.saturating_sub(tag_len);
+        // A peer-provided Initial token can consume the space needed after the header.
+        // Leave room for both a CONNECTION_CLOSE and a CRYPTO frame with data. The
+        // CRYPTO writer uses a strict `< max_size` check, hence the extra byte;
+        // CONNECTION_CLOSE can exactly fill the available space.
+        let required_frame_space = Ord::max(
+            frame::Crypto::SIZE_BOUND + 1,
+            frame::ConnectionClose::SIZE_BOUND,
+        );
+        if space_id == SpaceId::Initial
+            && (max_size < min_size || max_size.saturating_sub(buffer.len()) < required_frame_space)
+        {
+            buffer.truncate(partial_encode.start);
+            // Both Retry and cached address validation tokens originate from the peer.
+            conn.kill(
+                TransportError::PROTOCOL_VIOLATION(
+                    "Initial token leaves insufficient packet space",
+                )
+                .into(),
+            );
+            return None;
+        }
         debug_assert!(max_size >= min_size);
 
         Some(Self {

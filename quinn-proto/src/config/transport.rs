@@ -8,7 +8,8 @@ use qlog::streamer::QlogStreamer;
 #[cfg(feature = "qlog")]
 use crate::QlogStream;
 use crate::{
-    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
+    Dir, Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, MIN_INITIAL_SIZE, Side, StreamId,
+    TIMER_GRANULARITY, VarInt, VarIntBoundsExceeded, cid_queue::CidQueue, congestion,
     connection::qlog::QlogSink,
 };
 
@@ -27,9 +28,14 @@ use crate::{
 pub struct TransportConfig {
     pub(crate) max_concurrent_bidi_streams: VarInt,
     pub(crate) max_concurrent_uni_streams: VarInt,
+    pub(crate) stream_concurrency_cap: Option<VarInt>,
     pub(crate) max_idle_timeout: Option<VarInt>,
     pub(crate) stream_receive_window: VarInt,
+    pub(crate) stream_receive_window_bidi_local: Option<VarInt>,
+    pub(crate) stream_receive_window_bidi_remote: Option<VarInt>,
+    pub(crate) stream_receive_window_uni: Option<VarInt>,
     pub(crate) receive_window: VarInt,
+    pub(crate) receive_window_autotune: Option<(u64, u64)>,
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
 
@@ -40,6 +46,17 @@ pub struct TransportConfig {
     pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
     pub(crate) pad_to_mtu: bool,
+    pub(crate) initial_datagram_size: u16,
+    pub(crate) initial_packet_number: u64,
+    pub(crate) active_connection_id_limit: u32,
+    pub(crate) ack_delay_exponent: u8,
+    pub(crate) max_ack_delay: Duration,
+    pub(crate) min_ack_delay: Duration,
+    pub(crate) ack_frequency_draft_00: bool,
+    pub(crate) reset_stream_at: bool,
+    pub(crate) min_packet_number_len: u8,
+    pub(crate) early_key_update: bool,
+    pub(crate) send_greased_quic_bit: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -73,6 +90,17 @@ impl TransportConfig {
     /// Variant of `max_concurrent_bidi_streams` affecting unidirectional streams
     pub fn max_concurrent_uni_streams(&mut self, value: VarInt) -> &mut Self {
         self.max_concurrent_uni_streams = value;
+        self
+    }
+
+    /// Most incoming streams of each direction that may be open concurrently, whatever
+    /// `max_concurrent_*_streams` or `Connection::set_max_remote_streams` grant
+    ///
+    /// A grant past it waits for the peer's streams to close. The streams the transport
+    /// parameters grant (`max_concurrent_*_streams`, which a crypto session sending its own
+    /// must match) stay granted, however many. Defaults to `None`: no cap.
+    pub fn stream_concurrency_cap(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.stream_concurrency_cap = value;
         self
     }
 
@@ -116,6 +144,55 @@ impl TransportConfig {
         self
     }
 
+    /// [`stream_receive_window`](Self::stream_receive_window) for the bidirectional streams
+    /// this endpoint opens, which it advertises as its initial_max_stream_data_bidi_local
+    /// transport parameter
+    ///
+    /// Defaults to `None`: the common `stream_receive_window`.
+    pub fn stream_receive_window_bidi_local(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.stream_receive_window_bidi_local = value;
+        self
+    }
+
+    /// [`stream_receive_window`](Self::stream_receive_window) for the bidirectional streams
+    /// the peer opens, which it advertises as its initial_max_stream_data_bidi_remote
+    /// transport parameter
+    ///
+    /// Defaults to `None`: the common `stream_receive_window`.
+    pub fn stream_receive_window_bidi_remote(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.stream_receive_window_bidi_remote = value;
+        self
+    }
+
+    /// [`stream_receive_window`](Self::stream_receive_window) for the unidirectional streams
+    /// the peer opens, which it advertises as its initial_max_stream_data_uni transport
+    /// parameter
+    ///
+    /// Defaults to `None`: the common `stream_receive_window`.
+    pub fn stream_receive_window_uni(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.stream_receive_window_uni = value;
+        self
+    }
+
+    /// The per-stream receive windows by stream kind (see
+    /// [`stream_receive_window`](Self::stream_receive_window))
+    pub(crate) fn stream_receive_windows(&self) -> StreamReceiveWindows {
+        StreamReceiveWindows {
+            bidi_local: self
+                .stream_receive_window_bidi_local
+                .unwrap_or(self.stream_receive_window)
+                .into(),
+            bidi_remote: self
+                .stream_receive_window_bidi_remote
+                .unwrap_or(self.stream_receive_window)
+                .into(),
+            uni: self
+                .stream_receive_window_uni
+                .unwrap_or(self.stream_receive_window)
+                .into(),
+        }
+    }
+
     /// Maximum number of bytes the peer may transmit across all streams of a connection before
     /// becoming blocked.
     ///
@@ -124,6 +201,19 @@ impl TransportConfig {
     /// stream while another is blocked.
     pub fn receive_window(&mut self, value: VarInt) -> &mut Self {
         self.receive_window = value;
+        self
+    }
+
+    /// Grows the receive windows past [`stream_receive_window`](Self::stream_receive_window) and
+    /// [`receive_window`](Self::receive_window) while the application reads faster than they let
+    /// the peer send, up to the given most a stream's window and the connection's may reach
+    ///
+    /// As quic-go and Chrome autotune theirs: when more than half of a window is read in less than
+    /// four smoothed round trips' share of it, the window doubles for its next update, and the
+    /// connection's is kept at least 1.5 times any stream's. Windows never shrink, and the
+    /// transport parameters still announce the configured ones. Defaults to `None`: fixed windows.
+    pub fn receive_window_autotune(&mut self, value: Option<(u64, u64)>) -> &mut Self {
+        self.receive_window_autotune = value;
         self
     }
 
@@ -193,7 +283,9 @@ impl TransportConfig {
     }
 
     pub(crate) fn get_initial_mtu(&self) -> u16 {
-        self.initial_mtu.max(self.min_mtu)
+        self.initial_mtu
+            .max(self.min_mtu)
+            .max(self.initial_datagram_size)
     }
 
     /// The maximum UDP payload size guaranteed to be supported by the network.
@@ -233,6 +325,118 @@ impl TransportConfig {
     /// too large to be coalesced.
     pub fn pad_to_mtu(&mut self, value: bool) -> &mut Self {
         self.pad_to_mtu = value;
+        self
+    }
+
+    /// The size a client pads each UDP datagram carrying an Initial packet to, and a server each
+    /// carrying an ack-eliciting Initial packet, as do both a path challenge or response
+    ///
+    /// Defaults to 1200, the least QUIC allows; lower values are raised to it. The initial MTU
+    /// (see [`TransportConfig::initial_mtu`]) is at least this size.
+    pub fn initial_datagram_size(&mut self, value: u16) -> &mut Self {
+        self.initial_datagram_size = value.max(MIN_INITIAL_SIZE);
+        self
+    }
+
+    /// The packet number each packet number space starts at
+    ///
+    /// Defaults to 0.
+    pub fn initial_packet_number(&mut self, value: u64) -> &mut Self {
+        self.initial_packet_number = value;
+        self
+    }
+
+    /// How many of the peer's connection IDs this endpoint stores, which it advertises as its
+    /// active_connection_id_limit transport parameter unless its own connection IDs are
+    /// zero-length (then it sends none, meaning 2)
+    ///
+    /// Defaults to 5. Values below 2 are raised to 2. The connection stores only the
+    /// connection IDs the peer issues, so a large value costs memory only when the peer uses
+    /// it, and never more than 4096 at once: a peer issuing more exceeds the limit.
+    pub fn active_connection_id_limit(&mut self, value: u32) -> &mut Self {
+        self.active_connection_id_limit = value.max(2);
+        self
+    }
+
+    /// The exponent this endpoint scales its ACK frames' delay by, which it advertises as its
+    /// ack_delay_exponent transport parameter
+    ///
+    /// Defaults to 3. Values above 20 are lowered to 20.
+    pub fn ack_delay_exponent(&mut self, value: u8) -> &mut Self {
+        self.ack_delay_exponent = value.min(20);
+        self
+    }
+
+    /// The longest this endpoint delays acknowledging ack-eliciting packets, which it advertises
+    /// as its max_ack_delay transport parameter (in milliseconds)
+    ///
+    /// Defaults to 25 ms. Values are truncated to milliseconds and clamped to 1..=16383 ms.
+    pub fn max_ack_delay(&mut self, value: Duration) -> &mut Self {
+        self.max_ack_delay =
+            Duration::from_millis(value.as_millis().clamp(1, (1 << 14) - 1) as u64);
+        self
+    }
+
+    /// The fewest bytes a packet number is encoded in
+    ///
+    /// Packet numbers are encoded in as few bytes as the peer can decode them from, and at
+    /// least this many. Defaults to 1; values are clamped to 1..=4.
+    pub fn min_packet_number_len(&mut self, value: u8) -> &mut Self {
+        self.min_packet_number_len = value.clamp(1, 4);
+        self
+    }
+
+    /// Whether to update the 1-RTT keys once early in the connection, after a random 10 to 999
+    /// packets, exercising the peer's key update support
+    ///
+    /// Otherwise keys are updated only as they approach their confidentiality limit, as most
+    /// endpoints do. Defaults to `true`.
+    pub fn early_key_update(&mut self, value: bool) -> &mut Self {
+        self.early_key_update = value;
+        self
+    }
+
+    /// Whether to grease the QUIC bit (RFC 9287) of the packets sent, clearing it at random, where
+    /// the peer announced grease_quic_bit; a connection's changes with
+    /// [`Connection::set_send_greased_quic_bit`](crate::Connection::set_send_greased_quic_bit)
+    ///
+    /// Defaults to `true`.
+    pub fn send_greased_quic_bit(&mut self, value: bool) -> &mut Self {
+        self.send_greased_quic_bit = value;
+        self
+    }
+
+    /// The shortest acknowledgement delay this endpoint lets the peer request with an
+    /// ACK_FREQUENCY frame, which it advertises as its min_ack_delay transport parameter (in
+    /// microseconds)
+    ///
+    /// Defaults to the timer granularity (1 ms). Values are truncated to microseconds and
+    /// clamped to `1..=2^24` µs; a request below the timer granularity is honoured at the
+    /// granularity.
+    pub fn min_ack_delay(&mut self, value: Duration) -> &mut Self {
+        self.min_ack_delay = Duration::from_micros(value.as_micros().clamp(1, 1 << 24) as u64);
+        self
+    }
+
+    /// Whether the peer's ACK_FREQUENCY frames are laid out as draft-ietf-quic-ack-frequency-00
+    /// lays them out (a Packet Tolerance, and an Ignore Order byte), as they are for a peer
+    /// told this endpoint's min_ack_delay as that draft's transport parameter (0xff02de1a) by
+    /// a crypto session sending its own transport parameters
+    ///
+    /// Defaults to `false`: the layout of the draft quinn implements.
+    pub fn ack_frequency_draft_00(&mut self, value: bool) -> &mut Self {
+        self.ack_frequency_draft_00 = value;
+        self
+    }
+
+    /// Whether the peer may send RESET_STREAM_AT frames (draft-ietf-quic-reliable-stream-reset),
+    /// as it may once told this endpoint's reset_stream_at transport parameter by a crypto
+    /// session sending its own transport parameters (quinn doesn't send it): a stream reset
+    /// with one still delivers its data up to the frame's Reliable Size, then reports the reset
+    ///
+    /// Defaults to `false`: such a frame is a connection error, as any unknown frame type.
+    pub fn reset_stream_at(&mut self, value: bool) -> &mut Self {
+        self.reset_stream_at = value;
         self
     }
 
@@ -360,6 +564,38 @@ impl TransportConfig {
     }
 }
 
+/// The per-stream receive windows of a [`TransportConfig`], by stream kind: the limits it
+/// advertises as initial_max_stream_data_bidi_local, initial_max_stream_data_bidi_remote and
+/// initial_max_stream_data_uni
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct StreamReceiveWindows {
+    pub(crate) bidi_local: u64,
+    pub(crate) bidi_remote: u64,
+    pub(crate) uni: u64,
+}
+
+impl StreamReceiveWindows {
+    /// The window of stream `id` at an endpoint on `side`
+    pub(crate) fn of(&self, side: Side, id: StreamId) -> u64 {
+        match (id.dir(), id.initiator() == side) {
+            (Dir::Bi, true) => self.bidi_local,
+            (Dir::Bi, false) => self.bidi_remote,
+            (Dir::Uni, _) => self.uni,
+        }
+    }
+}
+
+impl From<VarInt> for StreamReceiveWindows {
+    fn from(window: VarInt) -> Self {
+        let window = window.into();
+        Self {
+            bidi_local: window,
+            bidi_remote: window,
+            uni: window,
+        }
+    }
+}
+
 impl Default for TransportConfig {
     fn default() -> Self {
         const EXPECTED_RTT: u32 = 100; // ms
@@ -371,10 +607,15 @@ impl Default for TransportConfig {
         Self {
             max_concurrent_bidi_streams: 100u32.into(),
             max_concurrent_uni_streams: 100u32.into(),
+            stream_concurrency_cap: None,
             // 30 second default recommended by RFC 9308 § 3.2
             max_idle_timeout: Some(VarInt(30_000)),
             stream_receive_window: STREAM_RWND.into(),
+            stream_receive_window_bidi_local: None,
+            stream_receive_window_bidi_remote: None,
+            stream_receive_window_uni: None,
             receive_window: VarInt::MAX,
+            receive_window_autotune: None,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
 
@@ -385,6 +626,17 @@ impl Default for TransportConfig {
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
+            initial_datagram_size: MIN_INITIAL_SIZE,
+            initial_packet_number: 0,
+            active_connection_id_limit: CidQueue::LEN as u32,
+            ack_delay_exponent: 3,
+            max_ack_delay: Duration::from_millis(25),
+            min_ack_delay: TIMER_GRANULARITY,
+            ack_frequency_draft_00: false,
+            reset_stream_at: false,
+            min_packet_number_len: 1,
+            early_key_update: true,
+            send_greased_quic_bit: true,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -410,9 +662,14 @@ impl fmt::Debug for TransportConfig {
         let Self {
             max_concurrent_bidi_streams,
             max_concurrent_uni_streams,
+            stream_concurrency_cap,
             max_idle_timeout,
             stream_receive_window,
+            stream_receive_window_bidi_local,
+            stream_receive_window_bidi_remote,
+            stream_receive_window_uni,
             receive_window,
+            receive_window_autotune,
             send_window,
             send_fairness,
             packet_threshold,
@@ -422,6 +679,17 @@ impl fmt::Debug for TransportConfig {
             min_mtu,
             mtu_discovery_config,
             pad_to_mtu,
+            initial_datagram_size,
+            initial_packet_number,
+            active_connection_id_limit,
+            ack_delay_exponent,
+            max_ack_delay,
+            min_ack_delay,
+            ack_frequency_draft_00,
+            reset_stream_at,
+            min_packet_number_len,
+            early_key_update,
+            send_greased_quic_bit,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -439,9 +707,20 @@ impl fmt::Debug for TransportConfig {
 
         s.field("max_concurrent_bidi_streams", max_concurrent_bidi_streams)
             .field("max_concurrent_uni_streams", max_concurrent_uni_streams)
+            .field("stream_concurrency_cap", stream_concurrency_cap)
             .field("max_idle_timeout", max_idle_timeout)
             .field("stream_receive_window", stream_receive_window)
+            .field(
+                "stream_receive_window_bidi_local",
+                stream_receive_window_bidi_local,
+            )
+            .field(
+                "stream_receive_window_bidi_remote",
+                stream_receive_window_bidi_remote,
+            )
+            .field("stream_receive_window_uni", stream_receive_window_uni)
             .field("receive_window", receive_window)
+            .field("receive_window_autotune", receive_window_autotune)
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)
@@ -451,6 +730,17 @@ impl fmt::Debug for TransportConfig {
             .field("min_mtu", min_mtu)
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
+            .field("initial_datagram_size", initial_datagram_size)
+            .field("initial_packet_number", initial_packet_number)
+            .field("active_connection_id_limit", active_connection_id_limit)
+            .field("ack_delay_exponent", ack_delay_exponent)
+            .field("max_ack_delay", max_ack_delay)
+            .field("min_ack_delay", min_ack_delay)
+            .field("ack_frequency_draft_00", ack_frequency_draft_00)
+            .field("reset_stream_at", reset_stream_at)
+            .field("min_packet_number_len", min_packet_number_len)
+            .field("early_key_update", early_key_update)
+            .field("send_greased_quic_bit", send_greased_quic_bit)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",

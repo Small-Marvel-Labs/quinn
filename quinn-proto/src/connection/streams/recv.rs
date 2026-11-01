@@ -4,20 +4,25 @@ use std::mem;
 use thiserror::Error;
 use tracing::debug;
 
-use super::state::get_or_insert_recv;
+use super::state::{get_or_insert_recv, grow_window};
 use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
 use crate::connection::streams::state::StreamRecv;
-use crate::{TransportError, VarInt, frame};
+use crate::{Duration, Instant, TransportError, VarInt, frame};
 
 #[derive(Debug, Default)]
 pub(super) struct Recv {
     // NB: when adding or removing fields, remember to update `reinit`.
     state: RecvState,
     pub(super) assembler: Assembler,
-    sent_max_stream_data: u64,
+    pub(super) sent_max_stream_data: u64,
     pub(super) end: u64,
     pub(super) stopped: bool,
+    /// Whether the application awaits how the peer ends this stopped stream
+    pub(super) awaiting_end: bool,
+    /// The window `MAX_STREAM_DATA` grants past the data read, and its autotune epoch
+    window: u64,
+    epoch: Option<(Instant, u64)>,
 }
 
 impl Recv {
@@ -28,6 +33,9 @@ impl Recv {
             sent_max_stream_data: initial_max_data,
             end: 0,
             stopped: false,
+            awaiting_end: false,
+            window: initial_max_data,
+            epoch: None,
         })
     }
 
@@ -38,6 +46,9 @@ impl Recv {
         self.sent_max_stream_data = initial_max_data;
         self.end = 0;
         self.stopped = false;
+        self.awaiting_end = false;
+        self.window = initial_max_data;
+        self.epoch = None;
     }
 
     /// Process a STREAM frame
@@ -78,8 +89,15 @@ impl Recv {
         // Don't bother storing data or releasing stream-level flow control credit if the stream's
         // already stopped
         if !self.stopped {
+            let mut data = frame.data;
+            // Nor data past the reliable size of a RESET_STREAM_AT, which isn't delivered
+            if let RecvState::ResetAt { reliable, .. } = self.state {
+                data.truncate(
+                    usize::try_from(reliable.saturating_sub(frame.offset)).unwrap_or(usize::MAX),
+                );
+            }
             self.assembler
-                .insert(frame.offset, frame.data, payload_len)
+                .insert(frame.offset, data, payload_len)
                 .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in stream buffer"))?;
         }
 
@@ -109,7 +127,8 @@ impl Recv {
     /// transmission of the value is recommended. If the boolean value is
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
-    pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
+    pub(super) fn max_stream_data(&mut self) -> (u64, ShouldTransmit) {
+        let stream_receive_window = self.window;
         let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
 
         // Only announce a window update if it's significant enough
@@ -122,6 +141,13 @@ impl Recv {
         let diff = max_stream_data - self.sent_max_stream_data;
         let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
         (max_stream_data, ShouldTransmit(transmit))
+    }
+
+    /// Grows the window, up to `max`, if it was read fast enough (see [`grow_window`]); returns the
+    /// grown window
+    pub(super) fn autotune(&mut self, max: u64, now: Instant, rtt: Duration) -> Option<u64> {
+        let read = self.assembler.bytes_read();
+        grow_window(&mut self.window, &mut self.epoch, read, max, now, rtt).then_some(self.window)
     }
 
     /// Records that a `MAX_STREAM_DATA` announcing a certain window was sent
@@ -155,13 +181,16 @@ impl Recv {
 
     /// Whether data is still being accepted from the peer
     pub(super) fn is_receiving(&self) -> bool {
-        matches!(self.state, RecvState::Recv { .. })
+        matches!(
+            self.state,
+            RecvState::Recv { .. } | RecvState::ResetAt { .. }
+        )
     }
 
     fn final_offset(&self) -> Option<u64> {
         match self.state {
             RecvState::Recv { size } => size,
-            RecvState::ResetRecvd { size, .. } => Some(size),
+            RecvState::ResetAt { size, .. } | RecvState::ResetRecvd { size, .. } => Some(size),
         }
     }
 
@@ -173,16 +202,7 @@ impl Recv {
         received: u64,
         max_data: u64,
     ) -> Result<bool, TransportError> {
-        // Validate final_offset
-        if let Some(offset) = self.final_offset() {
-            if offset != final_offset.into_inner() {
-                return Err(TransportError::FINAL_SIZE_ERROR("inconsistent value"));
-            }
-        } else if self.end > u64::from(final_offset) {
-            return Err(TransportError::FINAL_SIZE_ERROR(
-                "lower than high water mark",
-            ));
-        }
+        self.validate_reset(error_code, final_offset)?;
         self.credit_consumed_by(final_offset.into(), received, max_data)?;
 
         if matches!(self.state, RecvState::ResetRecvd { .. }) {
@@ -198,6 +218,74 @@ impl Recv {
         // reset streams.
         self.assembler.clear();
         Ok(true)
+    }
+
+    /// Process a RESET_STREAM_AT frame: the stream delivers its data up to the reliable size, if
+    /// not yet read, then the reset
+    ///
+    /// Returns the number of bytes the stream's final size newly accounts for.
+    pub(super) fn reset_at(
+        &mut self,
+        error_code: VarInt,
+        final_offset: VarInt,
+        reliable: u64,
+        received: u64,
+        max_data: u64,
+    ) -> Result<u64, TransportError> {
+        self.validate_reset(error_code, final_offset)?;
+        let new_bytes = self.credit_consumed_by(final_offset.into(), received, max_data)?;
+        // A reliable size can only decrease
+        let reliable = match self.state {
+            RecvState::ResetAt {
+                reliable: current, ..
+            } => current.min(reliable),
+            _ => reliable,
+        };
+        self.state = RecvState::ResetAt {
+            size: final_offset.into(),
+            reliable,
+            error_code,
+        };
+        self.end = final_offset.into();
+        self.assembler.truncate(reliable);
+        Ok(new_bytes)
+    }
+
+    /// Checks a reset's final size against the stream's, and its error code against an earlier
+    /// RESET_STREAM_AT's
+    fn validate_reset(
+        &self,
+        error_code: VarInt,
+        final_offset: VarInt,
+    ) -> Result<(), TransportError> {
+        // Validate final_offset
+        if let Some(offset) = self.final_offset() {
+            if offset != final_offset.into_inner() {
+                return Err(TransportError::FINAL_SIZE_ERROR("inconsistent value"));
+            }
+        } else if self.end > u64::from(final_offset) {
+            return Err(TransportError::FINAL_SIZE_ERROR(
+                "lower than high water mark",
+            ));
+        }
+        if matches!(self.state, RecvState::ResetAt { error_code: code, .. } if code != error_code) {
+            return Err(TransportError::STREAM_STATE_ERROR(
+                "reset error code changed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// How the peer ended the stream, if it did: with its reset's error code, or `None` by sending
+    /// all of it
+    pub(super) fn ended(&self) -> Option<Option<VarInt>> {
+        match self.state {
+            RecvState::Recv { size: None } => None,
+            RecvState::Recv { size: Some(_) } => Some(None),
+            RecvState::ResetAt { error_code, .. } | RecvState::ResetRecvd { error_code, .. } => {
+                Some(Some(error_code))
+            }
+        }
     }
 
     pub(super) fn reset_code(&self) -> Option<VarInt> {
@@ -265,11 +353,14 @@ impl<'a> Chunks<'a> {
             Entry::Vacant(_) => return Err(ReadableError::ClosedStream),
         };
 
-        let mut recv =
-            match get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
-                true => return Err(ReadableError::ClosedStream),
-                false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
-            };
+        let mut recv = match get_or_insert_recv(streams.stream_receive_window.of(streams.side, id))(
+            entry.get_mut(),
+        )
+        .stopped
+        {
+            true => return Err(ReadableError::ClosedStream),
+            false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
+        };
 
         recv.assembler.ensure_ordering(ordered)?;
         Ok(Self {
@@ -288,8 +379,8 @@ impl<'a> Chunks<'a> {
     pub fn next(&mut self, max_length: usize) -> Result<Option<Chunk>, ReadError> {
         let rs = match self.state {
             ChunksState::Readable(ref mut rs) => rs,
-            ChunksState::Reset(error_code) => {
-                return Err(ReadError::Reset(error_code));
+            ChunksState::Reset(ref error) => {
+                return Err(error.clone());
             }
             ChunksState::Finished => {
                 return Ok(None);
@@ -305,7 +396,10 @@ impl<'a> Chunks<'a> {
         match rs.state {
             RecvState::ResetRecvd { error_code, .. } => {
                 debug_assert_eq!(self.read, 0, "reset streams have empty buffers");
-                let state = mem::replace(&mut self.state, ChunksState::Reset(error_code));
+                let state = mem::replace(
+                    &mut self.state,
+                    ChunksState::Reset(ReadError::Reset(error_code)),
+                );
                 // At this point if we have `rs` self.state must be `ChunksState::Readable`
                 let recv = match state {
                     ChunksState::Readable(recv) => StreamRecv::Open(recv),
@@ -314,6 +408,27 @@ impl<'a> Chunks<'a> {
                 self.streams.stream_recv_freed(self.id, recv);
                 Err(ReadError::Reset(error_code))
             }
+            RecvState::ResetAt {
+                size,
+                reliable,
+                error_code,
+            } if rs.assembler.has_read_to(reliable) => {
+                // The data past the reliable size, never read, releases its flow control credit
+                self.read += size - rs.assembler.bytes_read();
+                let error = ReadError::ResetAt {
+                    error_code,
+                    reliable_size: reliable,
+                };
+                let state = mem::replace(&mut self.state, ChunksState::Reset(error.clone()));
+                // At this point if we have `rs` self.state must be `ChunksState::Readable`
+                let recv = match state {
+                    ChunksState::Readable(recv) => StreamRecv::Open(recv),
+                    _ => unreachable!("state must be ChunkState::Readable"),
+                };
+                self.streams.stream_recv_freed(self.id, recv);
+                Err(error)
+            }
+            RecvState::ResetAt { .. } => Err(ReadError::Blocked),
             RecvState::Recv { size } => {
                 if size == Some(rs.end) && rs.assembler.bytes_read() == rs.end {
                     let state = mem::replace(&mut self.state, ChunksState::Finished);
@@ -362,7 +477,7 @@ impl<'a> Chunks<'a> {
 
         // If the stream hasn't finished, we may need to issue stream-level flow control credit
         if let ChunksState::Readable(mut rs) = state {
-            let (_, max_stream_data) = rs.max_stream_data(self.streams.stream_receive_window);
+            let (_, max_stream_data) = rs.max_stream_data();
             should_transmit |= max_stream_data.0;
             if max_stream_data.0 {
                 self.pending.max_stream_data.insert(self.id);
@@ -389,7 +504,7 @@ impl Drop for Chunks<'_> {
 
 enum ChunksState {
     Readable(Box<Recv>),
-    Reset(VarInt),
+    Reset(ReadError),
     Finished,
     Finalized,
 }
@@ -408,6 +523,15 @@ pub enum ReadError {
     /// Carries an application-defined error code.
     #[error("reset by peer: code {0}")]
     Reset(VarInt),
+    /// The peer abandoned transmitting data on this stream past `reliable_size`, with
+    /// RESET_STREAM_AT, and all of the data before it was read.
+    #[error("reset by peer at {reliable_size}: code {error_code}")]
+    ResetAt {
+        /// The application-defined error code
+        error_code: VarInt,
+        /// The reliable size: the stream's data before it was delivered
+        reliable_size: u64,
+    },
 }
 
 /// Errors triggered when opening a recv stream for reading
@@ -432,8 +556,19 @@ impl From<IllegalOrderedRead> for ReadableError {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum RecvState {
-    Recv { size: Option<u64> },
-    ResetRecvd { size: u64, error_code: VarInt },
+    Recv {
+        size: Option<u64>,
+    },
+    /// RESET_STREAM_AT received: the data up to `reliable` is still delivered, then the reset
+    ResetAt {
+        size: u64,
+        reliable: u64,
+        error_code: VarInt,
+    },
+    ResetRecvd {
+        size: u64,
+        error_code: VarInt,
+    },
 }
 
 impl Default for RecvState {
@@ -483,7 +618,7 @@ mod tests {
             "full connection flow control credit is issued by stop"
         );
 
-        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        let (max_stream_data, transmit) = s.max_stream_data();
         assert!(!transmit.should_transmit());
         assert_eq!(
             max_stream_data, RECV_WINDOW,
@@ -508,7 +643,7 @@ mod tests {
         assert_eq!(new_bytes, RECV_WINDOW - (INITIAL_OFFSET + INITIAL_BYTES));
         assert!(!is_closed);
 
-        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        let (max_stream_data, transmit) = s.max_stream_data();
         assert!(!transmit.should_transmit());
         assert_eq!(
             max_stream_data, RECV_WINDOW,
@@ -535,7 +670,7 @@ mod tests {
         );
         assert!(!is_closed);
 
-        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        let (max_stream_data, transmit) = s.max_stream_data();
         assert!(!transmit.should_transmit());
         assert_eq!(
             max_stream_data, RECV_WINDOW,

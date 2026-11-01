@@ -62,7 +62,8 @@ pub use proto::BloomTokenLog;
 pub use proto::{
     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
     ConnectError, ConnectionClose, ConnectionError, ConnectionId, ConnectionIdGenerator,
-    ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout,
+    ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FirstFlight, FrameStats, FrameType,
+    IdleTimeout,
     MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats, ServerConfig, Side, StdSystemTime,
     StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit,
     TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
@@ -100,7 +101,9 @@ enum ConnectionEvent {
         reason: bytes::Bytes,
     },
     Proto(proto::ConnectionEvent),
-    Rebind(Arc<dyn AsyncUdpSocket>),
+    /// The endpoint's new socket, and whether the connection migrates to it (see
+    /// [`Endpoint::rebind_abstract_keeping_cids`])
+    Rebind(Arc<dyn AsyncUdpSocket>, bool),
 }
 
 fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {

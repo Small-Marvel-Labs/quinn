@@ -251,6 +251,17 @@ impl Endpoint {
     ///
     /// On error, the old UDP socket is retained.
     pub fn rebind_abstract(&self, socket: Arc<dyn AsyncUdpSocket>) -> io::Result<()> {
+        self.rebind_socket(socket, true)
+    }
+
+    /// Switch to a new UDP socket as a NAT rebinding moves an endpoint: unlike
+    /// [`Endpoint::rebind_abstract()`], the connections keep their connection IDs and send
+    /// nothing for it, so their peers see only the address change (RFC 9000 §9.3)
+    pub fn rebind_abstract_keeping_cids(&self, socket: Arc<dyn AsyncUdpSocket>) -> io::Result<()> {
+        self.rebind_socket(socket, false)
+    }
+
+    fn rebind_socket(&self, socket: Arc<dyn AsyncUdpSocket>, migrate: bool) -> io::Result<()> {
         let addr = socket.local_addr()?;
         let mut inner = self.inner.state.lock().unwrap();
         inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
@@ -259,7 +270,7 @@ impl Endpoint {
         // Update connection socket references
         for sender in inner.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.clone()));
+            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.clone(), migrate));
         }
         if let Some(driver) = inner.driver.take() {
             // Ensure the driver can register for wake-ups from the new socket
@@ -454,12 +465,38 @@ impl EndpointInner {
         respond(transmit, &response_buffer, &*state.socket);
     }
 
+    pub(crate) fn version_negotiate(&self, incoming: proto::Incoming, versions: &[u32]) {
+        let mut state = self.state.lock().unwrap();
+        state.stats.refused_handshakes += 1;
+        let mut response_buffer = Vec::new();
+        let transmit = state
+            .inner
+            .version_negotiate(incoming, versions, &mut response_buffer);
+        respond(transmit, &response_buffer, &*state.socket);
+    }
+
     pub(crate) fn retry(&self, incoming: proto::Incoming) -> Result<(), proto::RetryError> {
         let mut state = self.state.lock().unwrap();
         let mut response_buffer = Vec::new();
         let transmit = state.inner.retry(incoming, &mut response_buffer)?;
         respond(transmit, &response_buffer, &*state.socket);
         Ok(())
+    }
+
+    pub(crate) fn acknowledge(&self, incoming: &proto::Incoming) {
+        let mut state = self.state.lock().unwrap();
+        let mut response_buffer = Vec::new();
+        if let Some(transmit) = state.inner.acknowledge(incoming, &mut response_buffer) {
+            respond(transmit, &response_buffer, &*state.socket);
+        }
+    }
+
+    pub(crate) fn first_flight(&self, incoming: &proto::Incoming) -> proto::FirstFlight {
+        self.state
+            .lock()
+            .unwrap()
+            .inner
+            .incoming_first_flight(incoming)
     }
 
     pub(crate) fn ignore(&self, incoming: proto::Incoming) {
@@ -751,12 +788,12 @@ impl RecvState {
         max_receive_segments: usize,
         endpoint: &proto::Endpoint,
     ) -> Self {
-        let recv_buf = vec![
-            0;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * max_receive_segments
-                * BATCH_SIZE
-        ];
+        // A slot takes one datagram, or the segments GRO coalesced, which Linux keeps under
+        // 64 KiB with their headers (GRO_LEGACY_MAX_SIZE for all but TCP)
+        let slot = (endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
+            * max_receive_segments)
+            .min(64 * 1024);
+        let recv_buf = vec![0; slot * BATCH_SIZE];
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),

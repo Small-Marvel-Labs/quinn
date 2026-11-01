@@ -23,6 +23,22 @@ impl Incoming {
         Self(Some(State { inner, endpoint }))
     }
 
+    /// What the client's packets carried so far: its first Initial and those buffered since
+    /// (see [`proto::Endpoint::incoming_first_flight`])
+    pub fn first_flight(&self) -> proto::FirstFlight {
+        let state = self.0.as_ref().unwrap();
+        state.endpoint.first_flight(&state.inner)
+    }
+
+    /// Acknowledges the client's Initial packets received so far, and those received later as
+    /// they come, without answering its handshake (see [`proto::Endpoint::acknowledge`]): one
+    /// whose handshake waits on something else then measures its RTT from the acknowledgements.
+    /// It can no longer be sent a Retry.
+    pub fn acknowledge(&self) {
+        let state = self.0.as_ref().unwrap();
+        state.endpoint.acknowledge(&state.inner);
+    }
+
     /// Attempt to accept this incoming connection (an error may still occur)
     pub fn accept(mut self) -> Result<Connecting, ConnectionError> {
         let state = self.0.take().unwrap();
@@ -44,6 +60,13 @@ impl Incoming {
     pub fn refuse(mut self) {
         let state = self.0.take().unwrap();
         state.endpoint.refuse(state.inner);
+    }
+
+    /// Answer this incoming connection attempt with a Version Negotiation packet listing
+    /// `versions`, as a server that doesn't support its version would
+    pub fn version_negotiate(mut self, versions: &[u32]) {
+        let state = self.0.take().unwrap();
+        state.endpoint.version_negotiate(state.inner, versions);
     }
 
     /// Respond with a retry packet, requiring the client to retry with address validation
@@ -97,6 +120,11 @@ impl Incoming {
     /// The original destination CID when initiating the connection
     pub fn orig_dst_cid(&self) -> ConnectionId {
         *self.0.as_ref().unwrap().inner.orig_dst_cid()
+    }
+
+    /// The source CID of the client's Initial packet
+    pub fn src_cid(&self) -> ConnectionId {
+        *self.0.as_ref().unwrap().inner.src_cid()
     }
 }
 

@@ -54,7 +54,12 @@ pub struct RecvStream {
     stream: StreamId,
     is_0rtt: bool,
     all_data_read: bool,
-    reset: Option<VarInt>,
+    reset: Option<proto::ReadError>,
+    /// Whether how the peer ends this stopped stream is awaited, in the connection's
+    /// `stopped_ends` until this is dropped
+    awaiting_end: bool,
+    /// How the peer had ended this stream when it was stopped
+    stopped_end: Option<Option<VarInt>>,
 }
 
 impl RecvStream {
@@ -65,6 +70,8 @@ impl RecvStream {
             is_0rtt,
             all_data_read: false,
             reset: None,
+            awaiting_end: false,
+            stopped_end: None,
         }
     }
 
@@ -190,7 +197,7 @@ impl RecvStream {
     /// If no data is available for reading, the method returns `Poll::Pending`
     /// and arranges for the current task (via cx.waker()) to receive a notification
     /// when the stream becomes readable or is closed.
-    fn poll_read_chunk(
+    pub fn poll_read_chunk(
         &mut self,
         cx: &mut Context,
         max_length: usize,
@@ -274,13 +281,97 @@ impl RecvStream {
         if self.is_0rtt && conn.check_0rtt().is_err() {
             return Ok(());
         }
-        conn.inner.recv_stream(self.stream).stop(error_code)?;
+        if self.awaiting_end || self.stopped_end.is_some() {
+            // Stopped already: quinn-proto refuses it
+            return conn.inner.recv_stream(self.stream).stop(error_code);
+        }
+        // How the peer ends the stream is kept for `stop_and_await_end`, even if it ends before
+        match conn
+            .inner
+            .recv_stream(self.stream)
+            .stop_awaiting_end(error_code)?
+        {
+            Some(end) => self.stopped_end = Some(end),
+            None => {
+                conn.stopped_ends.insert(self.stream, None);
+                self.awaiting_end = true;
+            }
+        }
         conn.wake();
         self.all_data_read = true;
         // Clean up shared state that might be left over from a cancalled read
         // operation, so `drop` doesn't have to
         conn.blocked_readers.remove(&self.stream);
         Ok(())
+    }
+
+    /// Stop accepting data as [`stop()`](Self::stop) does, then wait for the peer to end the stream
+    ///
+    /// Yields `Some` with the error code of the peer's reset, or `None` if it sent all of the
+    /// stream instead (or all of it was read): a relay can then end the stream it relays this one
+    /// to as the peer ended this one.
+    pub async fn stop_and_await_end(
+        &mut self,
+        error_code: VarInt,
+    ) -> Result<Option<VarInt>, ResetError> {
+        poll_fn(|cx| self.poll_stop_and_await_end(cx, error_code)).await
+    }
+
+    /// Polls [`Self::stop_and_await_end`]: the first call stops the stream, those after it
+    /// await its end
+    pub fn poll_stop_and_await_end(
+        &mut self,
+        cx: &mut Context,
+        error_code: VarInt,
+    ) -> Poll<Result<Option<VarInt>, ResetError>> {
+        if let Some(
+            proto::ReadError::Reset(code)
+            | proto::ReadError::ResetAt {
+                error_code: code, ..
+            },
+        ) = self.reset
+        {
+            return Poll::Ready(Ok(Some(code)));
+        }
+        if let Some(end) = self.stopped_end {
+            return Poll::Ready(Ok(end));
+        }
+        let mut conn = self.conn.state.lock("RecvStream::stop_and_await_end");
+        if self.is_0rtt && conn.check_0rtt().is_err() {
+            return Poll::Ready(Err(ResetError::ZeroRttRejected));
+        }
+        // A call cancelled while awaiting the end left the stream stopped: this one awaits it on
+        if !self.awaiting_end {
+            if let Some(e) = &conn.error {
+                return Poll::Ready(Err(e.clone().into()));
+            }
+            let ended = conn
+                .inner
+                .recv_stream(self.stream)
+                .stop_awaiting_end(error_code);
+            conn.wake();
+            self.all_data_read = true;
+            conn.blocked_readers.remove(&self.stream);
+            match ended {
+                Ok(Some(end)) => return Poll::Ready(Ok(end)),
+                Err(_) => return Poll::Ready(Ok(None)),
+                Ok(None) => {
+                    conn.stopped_ends.insert(self.stream, None);
+                    self.awaiting_end = true;
+                }
+            }
+        }
+        if let Some(Some(end)) = conn.stopped_ends.get(&self.stream) {
+            let end = *end;
+            conn.stopped_ends.remove(&self.stream);
+            self.awaiting_end = false;
+            return Poll::Ready(Ok(end));
+        }
+        if let Some(e) = &conn.error {
+            return Poll::Ready(Err(e.clone().into()));
+        }
+        conn.blocked_readers.insert(self.stream, cx.waker().clone());
+        Poll::Pending
     }
 
     /// Check if this stream has been opened during 0-RTT.
@@ -311,7 +402,13 @@ impl RecvStream {
                 return Poll::Ready(Err(ResetError::ZeroRttRejected));
             }
 
-            if let Some(code) = self.reset {
+            if let Some(
+                proto::ReadError::Reset(code)
+                | proto::ReadError::ResetAt {
+                    error_code: code, ..
+                },
+            ) = self.reset
+            {
                 return Poll::Ready(Ok(Some(code)));
             }
 
@@ -321,6 +418,7 @@ impl RecvStream {
                     // Stream state has just now been freed, so the connection may need to issue new
                     // stream ID flow control credit
                     conn.wake();
+                    self.reset = Some(proto::ReadError::Reset(error_code));
                     Poll::Ready(Ok(Some(error_code)))
                 }
                 Ok(None) => {
@@ -367,7 +465,7 @@ impl RecvStream {
         // If we stored an error during a previous call, return it now. This can happen if a
         // `read_fn` both wants to return data and also returns an error in its final stream status.
         let status = match self.reset {
-            Some(code) => ReadStatus::Failed(None, Reset(code)),
+            Some(ref reset) => ReadStatus::Failed(None, reset.clone()),
             None => {
                 let mut recv = conn.inner.recv_stream(self.stream);
                 let mut chunks = recv.read(ordered)?;
@@ -395,17 +493,26 @@ impl RecvStream {
                     Poll::Pending
                 }
             },
-            ReadStatus::Failed(read, Reset(error_code)) => match read {
-                None => {
-                    self.all_data_read = true;
-                    self.reset = Some(error_code);
-                    Poll::Ready(Err(ReadError::Reset(error_code)))
+            ReadStatus::Failed(read, reset) => {
+                self.reset = Some(reset.clone());
+                match read {
+                    None => {
+                        self.all_data_read = true;
+                        Poll::Ready(Err(match reset {
+                            Reset(error_code) => ReadError::Reset(error_code),
+                            ResetAt {
+                                error_code,
+                                reliable_size,
+                            } => ReadError::ResetAt {
+                                error_code,
+                                reliable_size,
+                            },
+                            Blocked => unreachable!("handled above"),
+                        }))
+                    }
+                    done => Poll::Ready(Ok(done)),
                 }
-                done => {
-                    self.reset = Some(error_code);
-                    Poll::Ready(Ok(done))
-                }
-            },
+            }
         }
     }
 }
@@ -522,6 +629,12 @@ impl tokio::io::AsyncRead for RecvStream {
 
 impl Drop for RecvStream {
     fn drop(&mut self) {
+        if self.awaiting_end {
+            let mut conn = self.conn.state.lock("RecvStream::drop");
+            conn.stopped_ends.remove(&self.stream);
+            conn.blocked_readers.remove(&self.stream);
+            return;
+        }
         if self.all_data_read {
             debug_assert!(
                 !self
@@ -558,6 +671,15 @@ pub enum ReadError {
     /// Carries an application-defined error code.
     #[error("stream reset by peer: error {0}")]
     Reset(VarInt),
+    /// The peer abandoned transmitting data on this stream past `reliable_size`, with
+    /// RESET_STREAM_AT, and all of the data before it was read
+    #[error("stream reset by peer at {reliable_size}: error {error_code}")]
+    ResetAt {
+        /// The application-defined error code
+        error_code: VarInt,
+        /// The reliable size: the stream's data before it was delivered
+        reliable_size: u64,
+    },
     /// The connection was lost
     #[error("connection lost")]
     ConnectionLost(#[from] ConnectionError),
@@ -602,7 +724,7 @@ impl From<ReadError> for io::Error {
     fn from(x: ReadError) -> Self {
         use ReadError::*;
         let kind = match x {
-            Reset { .. } | ZeroRttRejected => io::ErrorKind::ConnectionReset,
+            Reset { .. } | ResetAt { .. } | ZeroRttRejected => io::ErrorKind::ConnectionReset,
             ConnectionLost(_) | ClosedStream => io::ErrorKind::NotConnected,
             IllegalOrderedRead => io::ErrorKind::InvalidInput,
         };

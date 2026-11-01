@@ -28,8 +28,8 @@ use crate::{
     udp_transmit,
 };
 use proto::{
-    ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side, StreamEvent,
-    StreamId, congestion::Controller,
+    ConnectionClose, ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side,
+    StreamEvent, StreamId, congestion::Controller,
 };
 
 /// In-progress connection attempt future
@@ -38,6 +38,7 @@ pub struct Connecting {
     conn: Option<ConnectionRef>,
     connected: oneshot::Receiver<bool>,
     handshake_data_ready: Option<oneshot::Receiver<()>>,
+    server_versions: Option<Vec<u32>>,
 }
 
 impl Connecting {
@@ -76,6 +77,7 @@ impl Connecting {
             conn: Some(conn),
             connected: on_connected_recv,
             handshake_data_ready: Some(on_handshake_data_recv),
+            server_versions: None,
         }
     }
 
@@ -191,6 +193,14 @@ impl Connecting {
         let conn_ref: &ConnectionRef = self.conn.as_ref().expect("used after yielding Ready");
         conn_ref.state.lock("remote_address").inner.remote_address()
     }
+
+    /// The versions the server's Version Negotiation packet listed, once `poll` returned
+    /// [`ConnectionError::VersionMismatch`] for it
+    ///
+    /// See [`proto::Connection::server_versions()`].
+    pub fn server_versions(&self) -> Option<&[u32]> {
+        self.server_versions.as_deref()
+    }
 }
 
 impl Future for Connecting {
@@ -203,6 +213,7 @@ impl Future for Connecting {
                 drop(inner);
                 Ok(Connection(conn))
             } else {
+                self.server_versions = inner.inner.server_versions().map(<[u32]>::to_vec);
                 Err(inner
                     .error
                     .clone()
@@ -270,6 +281,10 @@ impl Future for ConnectionDriver {
         keep_going |= conn.drive_timer(cx);
         conn.forward_endpoint_events();
         conn.forward_app_events(&self.conn.shared);
+        conn.forward_stream_concurrency(&self.conn.shared);
+        conn.forward_pings(&self.conn.shared);
+        conn.forward_greased_packets(&self.conn.shared);
+        conn.forward_peer_migrations(&self.conn.shared);
 
         if !conn.inner.is_drained() {
             if keep_going {
@@ -435,6 +450,15 @@ impl Connection {
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
         let conn = &mut *self.0.state.lock("close");
         conn.close(error_code, Bytes::copy_from_slice(reason), &self.0.shared);
+    }
+
+    /// Close the connection immediately with a transport error, as [`close()`](Self::close)
+    /// does with an application one: `close`'s error code, frame type and reason go in a
+    /// CONNECTION_CLOSE frame of type 0x1c, as relaying one the peer of another connection sent
+    /// ([`ConnectionError::ConnectionClosed`]) needs
+    pub fn close_transport(&self, close: ConnectionClose) {
+        let conn = &mut *self.0.state.lock("close_transport");
+        conn.close_transport(close, &self.0.shared);
     }
 
     /// Transmit `data` as an unreliable, unordered application datagram
@@ -603,6 +627,135 @@ impl Connection {
         self.0.stable_id()
     }
 
+    /// Whether the connection's handshake is still in progress
+    ///
+    /// See [`proto::Connection::is_handshaking()`]. A server connection processes no 1-RTT
+    /// packet before its handshake completes: what it received while this holds came in 0-RTT.
+    pub fn is_handshaking(&self) -> bool {
+        self.0.state.lock("is_handshaking").inner.is_handshaking()
+    }
+
+    /// Send the peer a PING frame, in an ack-eliciting packet
+    ///
+    /// See [`proto::Connection::ping()`].
+    pub fn ping(&self) {
+        let mut conn = self.0.state.lock("ping");
+        conn.inner.ping();
+        conn.wake();
+    }
+
+    /// The idle timeout in effect
+    ///
+    /// See [`proto::Connection::idle_timeout()`].
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.0.state.lock("idle_timeout").inner.idle_timeout()
+    }
+
+    /// Resolves once a PING frame from the peer arrived, as `stats().frame_rx.ping` counts them
+    ///
+    /// One arriving after this is called wakes it, so it is called before reading the count.
+    pub fn ping_received(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.0.shared.ping_received.notified()
+    }
+
+    /// Stop answering the peer until the idle timeout ends the connection silently
+    ///
+    /// See [`proto::Connection::fall_silent()`].
+    pub fn fall_silent(&self) {
+        let mut conn = self.0.state.lock("fall_silent");
+        conn.inner.fall_silent();
+        conn.wake();
+    }
+
+    /// Whether the packets sent from now on may clear the QUIC bit
+    ///
+    /// See [`proto::Connection::set_send_greased_quic_bit()`].
+    pub fn set_send_greased_quic_bit(&self, value: bool) {
+        self.0
+            .state
+            .lock("set_send_greased_quic_bit")
+            .inner
+            .set_send_greased_quic_bit(value);
+    }
+
+    /// How many of the peer's packets cleared the QUIC bit
+    ///
+    /// See [`proto::Connection::greased_packets_received()`].
+    pub fn greased_packets_received(&self) -> u64 {
+        self.0
+            .state
+            .lock("greased_packets_received")
+            .inner
+            .greased_packets_received()
+    }
+
+    /// Resolves once a packet from the peer clearing the QUIC bit arrived
+    ///
+    /// One arriving after this is called wakes it, so it is called before reading the count.
+    pub fn greased_packet_received(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.0.shared.greased_packet_received.notified()
+    }
+
+    /// How many times the peer moved to another address, and whether its last move came with
+    /// another connection ID (an active migration, not a NAT rebinding)
+    ///
+    /// See [`proto::Connection::peer_migrations()`], [`proto::Connection::peer_migrated_cid()`].
+    pub fn peer_migrations(&self) -> (u64, bool) {
+        let state = self.0.state.lock("peer_migrations");
+        (
+            state.inner.peer_migrations(),
+            state.inner.peer_migrated_cid(),
+        )
+    }
+
+    /// How many times the peer moved to another address, and how many of those moves came with
+    /// another connection ID, read together: moves coalesced between two reads changed the
+    /// connection ID if the second count grew
+    ///
+    /// See [`proto::Connection::peer_migrations()`], [`proto::Connection::peer_cid_migrations()`].
+    pub fn peer_migration_counts(&self) -> (u64, u64) {
+        let state = self.0.state.lock("peer_migration_counts");
+        (
+            state.inner.peer_migrations(),
+            state.inner.peer_cid_migrations(),
+        )
+    }
+
+    /// Resolves once the peer moved to another address
+    ///
+    /// One arriving after this is called wakes it, so it is called before reading the count.
+    pub fn peer_migrated(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.0.shared.peer_migrated.notified()
+    }
+
+    /// Drop the connection's state without telling the peer, ending it with
+    /// [`ConnectionError::LocallyClosed`]
+    ///
+    /// See [`proto::Connection::abandon()`].
+    pub fn abandon(&self) {
+        let conn = &mut *self.0.state.lock("abandon");
+        if conn.error.is_some() {
+            return;
+        }
+        conn.inner.abandon();
+        conn.terminate(ConnectionError::LocallyClosed, &self.0.shared);
+        conn.wake();
+    }
+
+    /// Drop the connection's state as [`Self::abandon`] does, answering the peer's last packet
+    /// with a stateless reset
+    ///
+    /// See [`proto::Connection::abandon_with_reset()`].
+    pub fn abandon_with_reset(&self) {
+        let conn = &mut *self.0.state.lock("abandon_with_reset");
+        if conn.error.is_some() {
+            return;
+        }
+        conn.inner.abandon_with_reset();
+        conn.terminate(ConnectionError::LocallyClosed, &self.0.shared);
+        conn.wake();
+    }
+
     /// Update traffic keys spontaneously
     ///
     /// This primarily exists for testing purposes.
@@ -670,6 +823,99 @@ impl Connection {
         conn.inner.set_max_concurrent_streams(Dir::Bi, count);
         // May need to send MAX_STREAMS to make progress
         conn.wake();
+    }
+
+    /// How many streams of `dir` the peer's stream limit lets this connection have open at once
+    ///
+    /// See [`proto::Connection::local_stream_concurrency()`].
+    pub fn local_stream_concurrency(&self, dir: Dir) -> u64 {
+        self.0
+            .state
+            .lock("local_stream_concurrency")
+            .inner
+            .local_stream_concurrency(dir)
+    }
+
+    /// How many streams of `dir` the peer's limit lets this connection open over its lifetime
+    ///
+    /// See [`proto::Connection::local_max_streams()`].
+    pub fn local_max_streams(&self, dir: Dir) -> u64 {
+        self.0
+            .state
+            .lock("local_max_streams")
+            .inner
+            .local_max_streams(dir)
+    }
+
+    /// How many streams of `dir` this connection opened
+    ///
+    /// See [`proto::Connection::local_streams_opened()`].
+    pub fn local_streams_opened(&self, dir: Dir) -> u64 {
+        self.0
+            .state
+            .lock("local_streams_opened")
+            .inner
+            .local_streams_opened(dir)
+    }
+
+    /// Resolves once [`Self::local_stream_concurrency()`], [`Self::local_max_streams()`] or
+    /// [`Self::local_streams_opened()`] changed for either direction
+    ///
+    /// A change made after this is called wakes it, so it is called before reading the value.
+    pub fn local_stream_concurrency_changed(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.0.shared.stream_concurrency_changed.notified()
+    }
+
+    /// Grant the peer `total` streams of `dir` over the connection's lifetime, in place of a
+    /// number open at once
+    ///
+    /// See [`proto::Connection::set_max_remote_streams()`].
+    pub fn set_max_remote_streams(&self, dir: Dir, total: VarInt) {
+        let mut conn = self.0.state.lock("set_max_remote_streams");
+        conn.inner.set_max_remote_streams(dir, total);
+        // May need to send MAX_STREAMS to make progress
+        conn.wake();
+    }
+
+    /// Mark the peer's stream `id` as relayed: closing it grants the peer no stream
+    ///
+    /// See [`proto::Connection::mark_stream_relayed()`].
+    pub fn mark_stream_relayed(&self, id: StreamId) {
+        self.0
+            .state
+            .lock("mark_stream_relayed")
+            .inner
+            .mark_stream_relayed(id);
+    }
+
+    /// Mark the peer's streams of `id`'s direction from `id` on as relayed
+    ///
+    /// See [`proto::Connection::mark_streams_relayed_from()`].
+    pub fn mark_streams_relayed_from(&self, id: StreamId) {
+        self.0
+            .state
+            .lock("mark_streams_relayed_from")
+            .inner
+            .mark_streams_relayed_from(id);
+    }
+
+    /// What this client connection sent before the server's first datagram arrived
+    ///
+    /// See [`proto::Connection::sent_first_flight()`].
+    pub fn sent_first_flight(&self) -> Option<proto::FirstFlight> {
+        self.0
+            .state
+            .lock("sent_first_flight")
+            .inner
+            .sent_first_flight()
+            .cloned()
+    }
+
+    /// The QUIC version the connection uses
+    ///
+    /// See [`proto::Connection::version()`].
+    pub fn version(&self) -> u32 {
+        self.0.state.lock("version").inner.version()
     }
 }
 
@@ -920,12 +1166,17 @@ impl ConnectionRef {
                 blocked_writers: FxHashMap::default(),
                 blocked_readers: FxHashMap::default(),
                 stopped: FxHashMap::default(),
+                stopped_ends: FxHashMap::default(),
                 error: None,
                 io_poller: socket.clone().create_io_poller(),
                 socket,
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
+                stream_concurrency: [[0; 3]; 2],
+                pings: 0,
+                greased_packets: 0,
+                peer_migrations: 0,
             }),
             shared: Shared::default(),
         }))
@@ -984,6 +1235,14 @@ pub(crate) struct Shared {
     datagram_received: Notify,
     datagrams_unblocked: Notify,
     closed: Notify,
+    /// Notified when the driver sees `local_stream_concurrency` change
+    stream_concurrency_changed: Notify,
+    /// Notified when the driver sees a PING frame from the peer arrive
+    ping_received: Notify,
+    /// Notified when the driver sees a packet clearing the QUIC bit arrive
+    greased_packet_received: Notify,
+    /// Notified when the driver sees the peer move to another address
+    peer_migrated: Notify,
     /// Number of live handles that can used to initiate or handle I/O; excludes the driver
     ref_count: AtomicUsize,
 }
@@ -1002,6 +1261,9 @@ pub(crate) struct State {
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
+    /// How the peer ended the stopped streams awaiting it (see
+    /// [`RecvStream::stop_and_await_end`]), once it did
+    pub(crate) stopped_ends: FxHashMap<StreamId, Option<Option<VarInt>>>,
     /// Always set to Some before the connection becomes drained
     pub(crate) error: Option<ConnectionError>,
     socket: Arc<dyn AsyncUdpSocket>,
@@ -1010,6 +1272,14 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
+    /// The local stream concurrency, limit and streams opened per direction the driver last saw
+    stream_concurrency: [[u64; 3]; 2],
+    /// How many PING frames from the peer the driver last saw arrived
+    pings: u64,
+    /// How many of the peer's packets clearing the QUIC bit the driver last saw arrived
+    greased_packets: u64,
+    /// How many of the peer's moves to another address the driver last saw
+    peer_migrations: u64,
 }
 
 impl State {
@@ -1096,10 +1366,12 @@ impl State {
     ) -> Result<(), ConnectionError> {
         loop {
             match self.conn_events.poll_recv(cx) {
-                Poll::Ready(Some(ConnectionEvent::Rebind(socket))) => {
+                Poll::Ready(Some(ConnectionEvent::Rebind(socket, migrate))) => {
                     self.socket = socket;
                     self.io_poller = self.socket.clone().create_io_poller();
-                    self.inner.local_address_changed();
+                    if migrate {
+                        self.inner.local_address_changed();
+                    }
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
                     self.inner.handle_event(event);
@@ -1118,6 +1390,48 @@ impl State {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    /// Wakes the tasks waiting for the local stream concurrency to change, if it did
+    fn forward_stream_concurrency(&mut self, shared: &Shared) {
+        let concurrency = [Dir::Bi, Dir::Uni].map(|dir| {
+            [
+                self.inner.local_stream_concurrency(dir),
+                self.inner.local_max_streams(dir),
+                self.inner.local_streams_opened(dir),
+            ]
+        });
+        if concurrency != self.stream_concurrency {
+            self.stream_concurrency = concurrency;
+            shared.stream_concurrency_changed.notify_waiters();
+        }
+    }
+
+    /// Wakes the tasks waiting for a PING frame from the peer, if one arrived
+    fn forward_pings(&mut self, shared: &Shared) {
+        let pings = self.inner.stats().frame_rx.ping;
+        if pings != self.pings {
+            self.pings = pings;
+            shared.ping_received.notify_waiters();
+        }
+    }
+
+    /// Wakes the tasks waiting for a packet clearing the QUIC bit, if one arrived
+    fn forward_greased_packets(&mut self, shared: &Shared) {
+        let greased = self.inner.greased_packets_received();
+        if greased != self.greased_packets {
+            self.greased_packets = greased;
+            shared.greased_packet_received.notify_waiters();
+        }
+    }
+
+    /// Wakes the tasks waiting for the peer to move to another address, if it did
+    fn forward_peer_migrations(&mut self, shared: &Shared) {
+        let migrations = self.inner.peer_migrations();
+        if migrations != self.peer_migrations {
+            self.peer_migrations = migrations;
+            shared.peer_migrated.notify_waiters();
         }
     }
 
@@ -1169,6 +1483,12 @@ impl State {
                 Stream(StreamEvent::Stopped { id, .. }) => {
                     wake_stream_notify(id, &mut self.stopped);
                     wake_stream(id, &mut self.blocked_writers);
+                }
+                Stream(StreamEvent::StoppedEnded { id, reset }) => {
+                    if let Some(end) = self.stopped_ends.get_mut(&id) {
+                        *end = Some(reset);
+                        wake_stream(id, &mut self.blocked_readers);
+                    }
                 }
             }
         }
@@ -1247,6 +1567,12 @@ impl State {
 
     fn close(&mut self, error_code: VarInt, reason: Bytes, shared: &Shared) {
         self.inner.close(self.runtime.now(), error_code, reason);
+        self.terminate(ConnectionError::LocallyClosed, shared);
+        self.wake();
+    }
+
+    fn close_transport(&mut self, close: ConnectionClose, shared: &Shared) {
+        self.inner.close_transport(self.runtime.now(), close);
         self.terminate(ConnectionError::LocallyClosed, shared);
         self.wake();
     }

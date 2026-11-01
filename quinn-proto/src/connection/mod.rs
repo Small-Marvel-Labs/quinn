@@ -15,18 +15,20 @@ use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
-    MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
-    TransportErrorCode, VarInt,
+    Dir, Duration, EndpointConfig, FirstFlight, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE,
+    MAX_STREAM_COUNT, MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit,
+    TransportError, TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
+    compatible_versions,
     config::{ServerConfig, TransportConfig},
     crypto::{self, KeyPair, Keys, PacketKey},
+    endpoint::{open_initial, write_stateless_reset},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
-        FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, LongType, Packet,
-        PacketNumber, PartialDecode, SpaceId,
+        FIXED_BIT, FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, LongType,
+        Packet, PacketNumber, PartialDecode, SpaceId,
     },
     range_set::ArrayRangeSet,
     shared::{
@@ -68,6 +70,7 @@ pub(crate) mod qlog;
 mod send_buffer;
 
 mod spaces;
+pub(crate) use spaces::MAX_ACK_BLOCKS;
 #[cfg(fuzzing)]
 pub use spaces::Retransmits;
 #[cfg(not(fuzzing))]
@@ -243,8 +246,43 @@ pub struct Connection {
     datagrams: DatagramState,
     /// Connection level statistics
     stats: ConnectionStats,
+    /// What a client connection sent before the server's first datagram arrived
+    sent_flight: Option<FirstFlight>,
+    /// Whether the connection stopped answering the peer (see [`Self::fall_silent`])
+    silent: bool,
+    /// The destination CID and length of the peer's last authenticated packet
+    last_received: Option<(ConnectionId, usize)>,
+    /// The stateless reset answering it, left to send (see [`Self::abandon_with_reset`])
+    reset_pending: Option<(ConnectionId, usize)>,
+    /// Whether packets may clear the QUIC bit when the peer announced grease_quic_bit (see
+    /// [`Self::set_send_greased_quic_bit`])
+    send_greased_quic_bit: bool,
+    /// How many of the peer's packets cleared the QUIC bit (RFC 9287)
+    greased_packets_received: u64,
+    /// The destination CID of the peer's latest non-probing packet on the current path
+    path_cid: Option<ConnectionId>,
+    /// How many times the peer moved to another address (see [`Self::peer_migrations`])
+    peer_migrations: u64,
+    /// How many of those moves came with another destination CID
+    peer_cid_migrations: u64,
+    /// Whether the peer's last move came with another destination CID
+    peer_migrated_cid: bool,
+    /// Whether the peer's move to the current path, while it awaits validation, came with
+    /// another destination CID
+    migrating_cid: bool,
     /// QUIC version used for the connection.
     version: u32,
+    /// The version the client chose, which its 0-RTT packets use whatever version compatible
+    /// version negotiation switched the connection to (RFC 9369 §4.1)
+    orig_version: u32,
+    /// The version a server switches the connection to once it processed the client's transport
+    /// parameters (RFC 9369 §4.1)
+    pending_version: Option<u32>,
+    /// The original version's Initial keys once the connection switched versions, for its
+    /// Initial packets still in flight
+    orig_initial_crypto: Option<Keys>,
+    /// The versions a server's Version Negotiation packet listed, when one ended the connection
+    server_versions: Option<Vec<u32>>,
 }
 
 impl Connection {
@@ -266,10 +304,37 @@ impl Connection {
     ) -> Self {
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
+        // A server switching versions answers in the client's until it has its transport
+        // parameters, while its session runs the version it switches to.
+        let (initial_keys, pending_version) = match &side_args {
+            SideArgs::Server {
+                server_config,
+                negotiated_version: Some(negotiated),
+                ..
+            } => (
+                server_config
+                    .crypto
+                    .initial_keys(version, &init_cid)
+                    .expect("the endpoint read the client's Initial with these keys"),
+                Some(*negotiated),
+            ),
+            _ => (crypto.initial_keys(&init_cid, side_args.side()), None),
+        };
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
+        let sent_flight = match &connection_side {
+            ConnectionSide::Client { token, .. } => Some(FirstFlight {
+                version,
+                dst_cid_len: rem_cid.len(),
+                src_cid_len: loc_cid.len(),
+                token_len: token.len(),
+                ..FirstFlight::default()
+            }),
+            ConnectionSide::Server { .. } => None,
+        };
         let initial_space = PacketSpace {
-            crypto: Some(crypto.initial_keys(&init_cid, side)),
+            crypto: Some(initial_keys),
+            next_packet_number: config.initial_packet_number,
             ..PacketSpace::new(now)
         };
         let state = State::Handshake(state::Handshake {
@@ -290,6 +355,7 @@ impl Connection {
                 if pref_addr_cid.is_some() { 2 } else { 1 },
             ),
             path: PathData::new(remote, allow_mtud, None, 0, now, &config),
+            send_greased_quic_bit: config.send_greased_quic_bit,
             path_counter: 0,
             allow_mtud,
             local_ip,
@@ -305,7 +371,11 @@ impl Connection {
             // simultaneous key update by both is just like a regular key update with a really fast
             // response. Inspired by quic-go's similar behavior of performing the first key update
             // at the 100th short-header packet.
-            key_phase_size: rng.random_range(10..1000),
+            key_phase_size: if config.early_key_update {
+                rng.random_range(10..1000)
+            } else {
+                u64::MAX
+            },
             peer_params: TransportParameters::default(),
             orig_rem_cid: rem_cid,
             initial_dst_cid: init_cid,
@@ -314,7 +384,17 @@ impl Connection {
             endpoint_events: VecDeque::new(),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
-            spaces: [initial_space, PacketSpace::new(now), PacketSpace::new(now)],
+            spaces: [
+                initial_space,
+                PacketSpace {
+                    next_packet_number: config.initial_packet_number,
+                    ..PacketSpace::new(now)
+                },
+                PacketSpace {
+                    next_packet_number: config.initial_packet_number,
+                    ..PacketSpace::new(now)
+                },
+            ],
             highest_space: SpaceId::Initial,
             prev_crypto: None,
             next_crypto: None,
@@ -338,9 +418,11 @@ impl Connection {
             path_responses: PathResponses::default(),
             close: false,
 
-            ack_frequency: AckFrequencyState::new(get_max_ack_delay(
-                &TransportParameters::default(),
-            )),
+            ack_frequency: AckFrequencyState::new(
+                get_max_ack_delay(&TransportParameters::default()),
+                config.max_ack_delay,
+                config.min_ack_delay,
+            ),
             next_bundled_ack_time: None,
 
             pto_count: 0,
@@ -355,18 +437,35 @@ impl Connection {
                 config.max_concurrent_bidi_streams,
                 config.send_window,
                 config.receive_window,
-                config.stream_receive_window,
+                config.stream_receive_windows(),
+                config.stream_concurrency_cap,
             ),
             datagrams: DatagramState::default(),
+            rem_cids: CidQueue::new(rem_cid, config.active_connection_id_limit as usize),
             config,
-            rem_cids: CidQueue::new(rem_cid),
             rng,
             stats: ConnectionStats::default(),
+            sent_flight,
+            silent: false,
+            last_received: None,
+            reset_pending: None,
+            greased_packets_received: 0,
+            path_cid: None,
+            peer_migrations: 0,
+            peer_cid_migrations: 0,
+            peer_migrated_cid: false,
+            migrating_cid: false,
             version,
+            orig_version: version,
+            pending_version,
+            orig_initial_crypto: None,
+            server_versions: None,
         };
         if path_validated {
             this.on_path_validated();
         }
+        this.streams
+            .set_receive_window_autotune(this.config.receive_window_autotune);
         if side.is_client() {
             // Kick off the connection
             this.write_crypto();
@@ -428,6 +527,7 @@ impl Connection {
     #[must_use]
     pub fn recv_stream(&mut self, id: StreamId) -> RecvStream<'_> {
         assert!(id.dir() == Dir::Bi || id.initiator() != self.side.side());
+        self.streams.insert_remote_through(id);
         RecvStream {
             id,
             state: &mut self.streams,
@@ -439,6 +539,7 @@ impl Connection {
     #[must_use]
     pub fn send_stream(&mut self, id: StreamId) -> SendStream<'_> {
         assert!(id.dir() == Dir::Bi || id.initiator() == self.side.side());
+        self.streams.insert_remote_through(id);
         SendStream {
             id,
             state: &mut self.streams,
@@ -464,6 +565,22 @@ impl Connection {
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
         assert!(max_datagrams != 0);
+        if self.silent {
+            return None;
+        }
+        if let Some((cid, inciting_len)) = self.reset_pending.take() {
+            let key = &*self.endpoint_config.reset_key;
+            if !write_stateless_reset(&mut self.rng, key, cid, inciting_len, buf) {
+                return None;
+            }
+            return Some(Transmit {
+                destination: self.path.remote,
+                ecn: None,
+                size: buf.len(),
+                segment_size: None,
+                src_ip: self.local_ip,
+            });
+        }
         let max_datagrams = match self.config.enable_segmentation_offload {
             false => 1,
             true => max_datagrams,
@@ -522,6 +639,8 @@ impl Connection {
         let mut builder_storage: Option<PacketBuilder> = None;
         let mut sent_frames = None;
         let mut pad_datagram = false;
+        // The size `pad_datagram` pads to: larger for a datagram carrying an Initial packet
+        let mut pad_size = MIN_INITIAL_SIZE;
         let mut pad_datagram_to_mtu = false;
         let mut congestion_blocked = false;
 
@@ -587,14 +706,19 @@ impl Connection {
 
                 // Anti-amplification is only based on `total_sent`, which gets
                 // updated at the end of this method. Therefore we pass the amount
-                // of bytes for datagrams that are already created, as well as 1 byte
-                // for starting another datagram. If there is any anti-amplification
-                // budget left, we always allow a full MTU to be sent
-                // (see https://github.com/quinn-rs/quinn/issues/1082)
-                if self
-                    .path
-                    .anti_amplification_blocked(segment_size as u64 * (num_datagrams as u64) + 1)
+                // of bytes for datagrams that are already created. Another is sized
+                // to what is left (RFC 9000 §8.1 allows no more than three times the
+                // bytes received, not even by part of a datagram), which must hold a
+                // packet: padded, if it is an Initial one that must be
+                let smallest = match space_id == SpaceId::Initial
+                    && (self.side.is_client() || ack_eliciting)
                 {
+                    true => usize::from(self.config.initial_datagram_size),
+                    false => MIN_PACKET_SPACE,
+                };
+                if self.path.anti_amplification_blocked(
+                    segment_size as u64 * (num_datagrams as u64) + smallest as u64,
+                ) {
                     trace!("blocked by anti-amplification");
                     break;
                 }
@@ -641,7 +765,7 @@ impl Connection {
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
                     if pad_datagram {
-                        builder.pad_to(MIN_INITIAL_SIZE);
+                        builder.pad_to(pad_size);
                     }
 
                     if num_datagrams > 1 || pad_datagram_to_mtu {
@@ -719,6 +843,15 @@ impl Connection {
                         std::cmp::min(segment_size, usize::from(INITIAL_MTU))
                     }
                 };
+                let next_datagram_size_limit = match self.path.validated {
+                    true => next_datagram_size_limit,
+                    false => {
+                        let sent =
+                            self.path.total_sent + segment_size as u64 * num_datagrams as u64;
+                        let left = (self.path.total_recvd * 3).saturating_sub(sent);
+                        next_datagram_size_limit.min(usize::try_from(left).unwrap_or(usize::MAX))
+                    }
+                };
                 buf_capacity += next_datagram_size_limit;
                 if buf.capacity() < buf_capacity {
                     // We reserve the maximum space for sending `max_datagrams` upfront
@@ -734,6 +867,10 @@ impl Connection {
                 num_datagrams += 1;
                 coalesce = true;
                 pad_datagram = false;
+                // Padded only as far as anti-amplification allows (RFC 9000 §8.2.1), but for
+                // an Initial packet, which the datagram then holds in full (see above)
+                pad_size = MIN_INITIAL_SIZE
+                    .min(u16::try_from(next_datagram_size_limit).unwrap_or(u16::MAX));
                 datagram_start = buf.len();
 
                 debug_assert_eq!(
@@ -786,8 +923,10 @@ impl Connection {
             coalesce = coalesce && !builder.short_header;
 
             // https://tools.ietf.org/html/draft-ietf-quic-transport-34#section-14.1
-            pad_datagram |=
-                space_id == SpaceId::Initial && (self.side.is_client() || ack_eliciting);
+            if space_id == SpaceId::Initial && (self.side.is_client() || ack_eliciting) {
+                pad_datagram = true;
+                pad_size = self.config.initial_datagram_size;
+            }
 
             if close {
                 trace!("sending CONNECTION_CLOSE");
@@ -796,6 +935,8 @@ impl Connection {
                 // especially important with ack delay, since the peer might not
                 // have gotten any other ACK for the data earlier on.
                 if !self.spaces[space_id].pending_acks.ranges().is_empty() {
+                    // Reserve room for CONNECTION_CLOSE even when an Initial token leaves
+                    // little space after the header.
                     Self::try_populate_acks(
                         now,
                         self.receiving_ecn,
@@ -803,18 +944,12 @@ impl Connection {
                         &mut self.spaces[space_id],
                         buf,
                         &mut self.stats,
-                        buf_capacity,
+                        builder.max_size - frame::ConnectionClose::SIZE_BOUND,
+                        self.config.ack_delay_exponent,
                     );
                 }
 
-                // Since there only 64 ACK frames there will always be enough space
-                // to encode the ConnectionClose frame too. However we still have the
-                // check here to prevent crashes if something changes.
-                debug_assert!(
-                    buf.len() + frame::ConnectionClose::SIZE_BOUND < builder.max_size,
-                    "ACKs should leave space for ConnectionClose"
-                );
-                if buf.len() + frame::ConnectionClose::SIZE_BOUND < builder.max_size {
+                if buf.len() + frame::ConnectionClose::SIZE_BOUND <= builder.max_size {
                     let max_frame_size = builder.max_size - buf.len();
                     match self.state {
                         State::Closed(state::Closed { ref reason }) => {
@@ -857,7 +992,9 @@ impl Connection {
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
             if space_id == SpaceId::Data && num_datagrams == 1 {
-                if let Some((token, remote)) = self.path_responses.pop_off_path(self.path.remote) {
+                if let Some((token, remote, received)) =
+                    self.path_responses.pop_off_path(self.path.remote)
+                {
                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                     // above.
                     let mut builder = builder_storage.take().unwrap();
@@ -865,7 +1002,11 @@ impl Connection {
                     buf.write(frame::FrameType::PATH_RESPONSE);
                     buf.write(token);
                     self.stats.frame_tx.path_response += 1;
-                    builder.pad_to(MIN_INITIAL_SIZE);
+                    // Padded only as far as three times the challenge's packet (RFC 9000 §8.2.2):
+                    // the address it came from is unvalidated
+                    builder.pad_to(
+                        MIN_INITIAL_SIZE.min(u16::try_from(3 * received).unwrap_or(u16::MAX)),
+                    );
                     builder.finish_and_track(
                         now,
                         self,
@@ -876,6 +1017,7 @@ impl Connection {
                         buf,
                     );
                     self.stats.udp_tx.on_sent(1, buf.len());
+                    self.record_sent_datagrams(buf.len(), None);
                     return Some(Transmit {
                         destination: remote,
                         size: buf.len(),
@@ -888,6 +1030,7 @@ impl Connection {
 
             let sent =
                 self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            self.path.challenge_undersized |= sent.path_challenge && pad_size < MIN_INITIAL_SIZE;
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -921,7 +1064,7 @@ impl Connection {
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
-                builder.pad_to(MIN_INITIAL_SIZE);
+                builder.pad_to(pad_size);
             }
 
             // If this datagram is a loss probe and `segment_size` is larger than `INITIAL_MTU`,
@@ -949,8 +1092,9 @@ impl Connection {
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
 
-        // Send MTU probe if necessary
-        if buf.is_empty() && self.state.is_established() {
+        // Send MTU probe if necessary, once the path is validated: padded, it would exceed
+        // what anti-amplification allows on an unvalidated one (RFC 9000 §8.1)
+        if buf.is_empty() && self.state.is_established() && self.path.validated {
             let space_id = SpaceId::Data;
             let probe_size = self
                 .path
@@ -1002,6 +1146,7 @@ impl Connection {
         self.path.total_sent = self.path.total_sent.saturating_add(buf.len() as u64);
 
         self.stats.udp_tx.on_sent(num_datagrams as u64, buf.len());
+        self.record_sent_datagrams(buf.len(), (num_datagrams > 1).then_some(segment_size));
 
         Some(Transmit {
             destination: self.path.remote,
@@ -1017,6 +1162,29 @@ impl Connection {
             },
             src_ip: self.local_ip,
         })
+    }
+
+    /// The first flight's record of a client connection still sending it (see
+    /// [`Self::sent_first_flight`])
+    fn first_flight_recording(&mut self) -> Option<&mut FirstFlight> {
+        match self.stats.udp_rx.datagrams {
+            0 => self.sent_flight.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// Records the datagrams of `size` bytes in total (each `segment_size` but the last) a
+    /// client connection sends in its first flight
+    fn record_sent_datagrams(&mut self, size: usize, segment_size: Option<usize>) {
+        let Some(flight) = self.first_flight_recording() else {
+            return;
+        };
+        let segment = segment_size.unwrap_or(size).max(1);
+        flight.datagram_sizes.extend(
+            (0..size)
+                .step_by(segment)
+                .map(|start| segment.min(size - start)),
+        );
     }
 
     /// Send PATH_CHALLENGE for a previous path if necessary
@@ -1128,6 +1296,9 @@ impl Connection {
                 first_decode,
                 remaining,
             }) => {
+                if self.silent {
+                    return;
+                }
                 // If this packet could initiate a migration and we're a client or a server that
                 // forbids migration, drop the datagram. This could be relaxed to heuristically
                 // permit NAT-rebinding-like migration.
@@ -1143,15 +1314,17 @@ impl Connection {
                 let data_len = first_decode.len();
 
                 self.handle_decode(now, remote, ecn, first_decode);
-                // The current `path` might have changed inside `handle_decode`,
-                // since the packet could have triggered a migration. Make sure
-                // the data received is accounted for the most recent path by accessing
-                // `path` after `handle_decode`.
-                self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
-
                 if let Some(data) = remaining {
                     self.stats.udp_rx.bytes += data.len() as u64;
                     self.handle_coalesced(now, remote, ecn, data);
+                }
+                // The current `path` might have changed while handling the datagram,
+                // since a packet could have triggered a migration. Make sure
+                // the data received is accounted for the most recent path by accessing
+                // `path` afterwards, and only if it came from that path's address: what is
+                // sent to an unvalidated address is limited by what it sent (RFC 9000 §8.1).
+                if remote == self.path.remote {
+                    self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
                 }
 
                 self.config.qlog_sink.emit_recovery_metrics(
@@ -1223,6 +1396,11 @@ impl Connection {
                     self.zero_rtt_crypto = None;
                     self.prev_crypto = None;
                 }
+                Timer::PathValidation if self.path.challenge.is_none() => {
+                    debug!("path MTU validation failed");
+                    self.path.mtu_challenge = None;
+                    self.path.mtu_challenge_pending = false;
+                }
                 Timer::PathValidation => {
                     debug!("path validation failed");
                     if let Some((_, prev)) = self.prev_path.take() {
@@ -1230,6 +1408,8 @@ impl Connection {
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
+                    self.path.mtu_challenge = None;
+                    self.path.mtu_challenge_pending = false;
                 }
                 Timer::Pacing => trace!("pacing timer expired"),
                 Timer::PushNewCid => {
@@ -1273,6 +1453,14 @@ impl Connection {
         )
     }
 
+    /// Close a connection immediately with a transport error, as [`Self::close`] does with an
+    /// application one: `close`'s error code, frame type and reason go in a CONNECTION_CLOSE
+    /// frame of type 0x1c, as relaying one a peer sent ([`ConnectionError::ConnectionClosed`])
+    /// needs
+    pub fn close_transport(&mut self, now: Instant, close: frame::ConnectionClose) {
+        self.close_inner(now, Close::Connection(close))
+    }
+
     fn close_inner(&mut self, now: Instant, reason: Close) {
         let was_closed = self.state.is_closed();
         if !was_closed {
@@ -1304,6 +1492,69 @@ impl Connection {
     /// Causes an ACK-eliciting packet to be transmitted.
     pub fn ping(&mut self) {
         self.spaces[self.highest_space].ping_pending = true;
+    }
+
+    /// The idle timeout in effect: the local one until the peer's transport parameters arrive,
+    /// then the one negotiated with them (RFC 9000 §10.1), `None` for none
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.idle_timeout
+    }
+
+    /// Stop answering the peer, as an endpoint whose path to it failed: the datagrams it sends
+    /// are dropped and nothing is sent, a close included, until the idle timeout ends the
+    /// connection silently ([`ConnectionError::TimedOut`]), as it ends the peer's
+    pub fn fall_silent(&mut self) {
+        self.silent = true;
+    }
+
+    /// Whether the packets sent from now on may clear the QUIC bit, as the peer's announced
+    /// grease_quic_bit allows: [`TransportConfig::send_greased_quic_bit`] at first
+    pub fn set_send_greased_quic_bit(&mut self, value: bool) {
+        self.send_greased_quic_bit = value;
+    }
+
+    /// How many of the peer's packets cleared the QUIC bit (RFC 9287), counting each
+    /// authenticated packet once
+    pub fn greased_packets_received(&self) -> u64 {
+        self.greased_packets_received
+    }
+
+    /// How many times the peer moved to another address: a server connection migrating with
+    /// its client, counted once the new path is validated (RFC 9000 §9.3), and not when its
+    /// validation fails or the peer returns to the address it had
+    pub fn peer_migrations(&self) -> u64 {
+        self.peer_migrations
+    }
+
+    /// How many of the peer's moves to another address (see [`Self::peer_migrations`]) came
+    /// with another connection ID, as an active migration does (RFC 9000 §9.5)
+    pub fn peer_cid_migrations(&self) -> u64 {
+        self.peer_cid_migrations
+    }
+
+    /// Whether the peer's last move to another address came with another connection ID, as an
+    /// active migration does (RFC 9000 §9.5), rather than with the one it had used (a NAT
+    /// rebinding the peer didn't notice)
+    pub fn peer_migrated_cid(&self) -> bool {
+        self.peer_migrated_cid
+    }
+
+    /// Drop the connection's state without telling the peer, as an endpoint that lost it: the
+    /// endpoint answers the peer's later packets with stateless resets
+    pub fn abandon(&mut self) {
+        if !self.state.is_drained() {
+            self.kill(ConnectionError::LocallyClosed);
+        }
+    }
+
+    /// Drop the connection's state as [`Self::abandon`] does, answering the peer's last packet
+    /// with the stateless reset the endpoint answers later ones with, as an endpoint that lost
+    /// the state before that packet arrived
+    pub fn abandon_with_reset(&mut self) {
+        if !self.state.is_drained() {
+            self.reset_pending = self.last_received;
+            self.kill(ConnectionError::LocallyClosed);
+        }
     }
 
     /// Update traffic keys spontaneously
@@ -1442,6 +1693,75 @@ impl Connection {
         // now be significant.
         let pending = &mut self.spaces[SpaceId::Data].pending;
         self.streams.queue_max_stream_id(pending);
+    }
+
+    /// How many locally initiated streams of `dir` the peer's stream limit lets this endpoint
+    /// have open at once: those it may still open plus those not fully closed
+    ///
+    /// It grows as the peer raises its limit with MAX_STREAMS and shrinks as streams close, until
+    /// the peer raises it again.
+    pub fn local_stream_concurrency(&self, dir: Dir) -> u64 {
+        self.streams.local_concurrency(dir)
+    }
+
+    /// How many locally initiated streams of `dir` the peer's limit lets this endpoint open over
+    /// the lifetime of the connection: its `initial_max_streams` raised by MAX_STREAMS
+    pub fn local_max_streams(&self, dir: Dir) -> u64 {
+        self.streams.local_max(dir)
+    }
+
+    /// How many locally initiated streams of `dir` this endpoint opened
+    pub fn local_streams_opened(&self, dir: Dir) -> u64 {
+        self.streams.local_opened(dir)
+    }
+
+    /// Grant the peer `total` streams of `dir` over the lifetime of the connection, sending
+    /// MAX_STREAMS as it grows, in place of [`set_max_concurrent_streams`] from now on
+    ///
+    /// Closing a stream no longer grants the peer another, except one not marked with
+    /// [`mark_stream_relayed`], which grants one past `total`. The total never shrinks. Streams
+    /// granted are allocated as the peer opens them.
+    ///
+    /// [`set_max_concurrent_streams`]: Self::set_max_concurrent_streams
+    /// [`mark_stream_relayed`]: Self::mark_stream_relayed
+    pub fn set_max_remote_streams(&mut self, dir: Dir, total: VarInt) {
+        self.streams.set_max_remote(dir, total);
+        let pending = &mut self.spaces[SpaceId::Data].pending;
+        self.streams.queue_max_stream_id(pending);
+    }
+
+    /// Mark the peer's stream `id`, not closed yet, as relayed: under
+    /// [`set_max_remote_streams`](Self::set_max_remote_streams), closing it grants no stream
+    pub fn mark_stream_relayed(&mut self, id: StreamId) {
+        self.streams.mark_relayed(id);
+    }
+
+    /// Mark the peer's streams of `id`'s direction from `id` on as relayed, as
+    /// [`mark_stream_relayed`](Self::mark_stream_relayed) marks one
+    pub fn mark_streams_relayed_from(&mut self, id: StreamId) {
+        self.streams.mark_relayed_from(id);
+    }
+
+    /// What this client connection sent before the server's first datagram arrived: each
+    /// datagram's size, each Initial packet's number and encoded number length, whether 0-RTT
+    /// packets went, and its first Initial's version and connection ID and token lengths
+    ///
+    /// `crypto` is left empty: the TLS session has the ClientHello. `None` for a server
+    /// connection.
+    pub fn sent_first_flight(&self) -> Option<&FirstFlight> {
+        self.sent_flight.as_ref()
+    }
+
+    /// The QUIC version the connection uses: the one compatible version negotiation (RFC 9368)
+    /// switched it to from the client's, if it did
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// The versions the server's Version Negotiation packet listed, once one ended this client
+    /// connection ([`ConnectionError::VersionMismatch`])
+    pub fn server_versions(&self) -> Option<&[u32]> {
+        self.server_versions.as_deref()
     }
 
     /// Current number of remotely initiated streams that may be concurrently open
@@ -2009,6 +2329,15 @@ impl Connection {
         }
     }
 
+    /// Numbers the server's Initial packets from `next` on, after those its endpoint sent
+    /// acknowledging the client's (see [`crate::Endpoint::acknowledge`]), and counts their `sent`
+    /// bytes against the anti-amplification limit
+    pub(crate) fn continue_acknowledgement(&mut self, next: u64, sent: u64) {
+        let space = &mut self.spaces[SpaceId::Initial];
+        space.next_packet_number = space.next_packet_number.max(next);
+        self.path.total_sent = self.path.total_sent.saturating_add(sent);
+    }
+
     /// Handle the already-decrypted first packet from the client
     ///
     /// Decrypting the first packet in the `Endpoint` allows stateless packet handling to be more
@@ -2193,6 +2522,13 @@ impl Connection {
         );
         trace!("{:?} keys ready", space);
         if space == SpaceId::Data {
+            if !self.config.early_key_update {
+                self.key_phase_size = crypto
+                    .packet
+                    .local
+                    .confidentiality_limit()
+                    .saturating_sub(KEY_UPDATE_MARGIN);
+            }
             // Precompute the first key update
             self.next_crypto = Some(
                 self.crypto
@@ -2218,6 +2554,7 @@ impl Connection {
             if let ConnectionSide::Client { token, .. } = &mut self.side {
                 *token = Bytes::new();
             }
+            self.orig_initial_crypto = None;
         }
         let space = &mut self.spaces[space_id];
         space.crypto = None;
@@ -2237,13 +2574,13 @@ impl Connection {
         ecn: Option<EcnCodepoint>,
         data: BytesMut,
     ) {
-        self.path.total_recvd = self.path.total_recvd.saturating_add(data.len() as u64);
+        let len = data.len();
         let mut remaining = Some(data);
         while let Some(data) = remaining {
             match PartialDecode::new(
                 data,
                 &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
-                &[self.version],
+                &self.endpoint_config.supported_versions,
                 self.endpoint_config.grease_quic_bit,
             ) {
                 Ok((partial_decode, rest)) => {
@@ -2252,9 +2589,13 @@ impl Connection {
                 }
                 Err(e) => {
                     trace!("malformed header: {}", e);
-                    return;
+                    break;
                 }
             }
+        }
+        // Accounted for the path it came from, as in `handle_event`
+        if remote == self.path.remote {
+            self.path.total_recvd = self.path.total_recvd.saturating_add(len as u64);
         }
     }
 
@@ -2265,14 +2606,105 @@ impl Connection {
         ecn: Option<EcnCodepoint>,
         partial_decode: PartialDecode,
     ) {
+        if let Some(version) = partial_decode.version() {
+            if !self.accepts_version(version, &partial_decode) {
+                debug!(version, "dropping packet of another version");
+                return;
+            }
+        }
         if let Some(decoded) = packet_crypto::unprotect_header(
             partial_decode,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.orig_initial(),
             self.peer_params.stateless_reset_token,
         ) {
             self.handle_packet(now, remote, ecn, decoded.packet, decoded.stateless_reset);
         }
+    }
+
+    /// Whether to process a long header packet of `version`: the connection's, the original's
+    /// for 0-RTT packets and Initial packets in flight when it switched, or one a client learns
+    /// the server negotiated from its first Initial packet using it (RFC 9369 §4.1)
+    fn accepts_version(&mut self, version: u32, packet: &PartialDecode) -> bool {
+        if packet.is_0rtt() {
+            return version == self.orig_version;
+        }
+        if version == self.version {
+            return true;
+        }
+        if version == self.orig_version {
+            return packet.is_initial() && self.orig_initial_crypto.is_some();
+        }
+        packet.is_initial() && self.switch_version(version, packet)
+    }
+
+    /// Switches a client connection to `version`, which the server negotiated from the one it
+    /// chose and offered, before the server's handshake data arrived (RFC 9368 §2.3), once
+    /// `packet`, an Initial packet of `version`, opens with `version`'s Initial keys: a packet
+    /// anyone can forge doesn't switch it
+    fn switch_version(&mut self, version: u32, packet: &PartialDecode) -> bool {
+        let ConnectionSide::Client {
+            available_versions, ..
+        } = &self.side
+        else {
+            return false;
+        };
+        if self.version != self.orig_version
+            || self.highest_space != SpaceId::Initial
+            || !compatible_versions(self.version, version)
+            || !available_versions.contains(&version)
+            || self.crypto.switch_version(version).is_err()
+        {
+            return false;
+        }
+        let cid = self.retry_src_cid.unwrap_or(self.initial_dst_cid);
+        let keys = self.crypto.initial_keys(&cid, self.side.side());
+        let opened = PartialDecode::new(
+            BytesMut::from(packet.data()),
+            &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
+            &self.endpoint_config.supported_versions,
+            self.endpoint_config.grease_quic_bit,
+        )
+        .ok()
+        .and_then(|(packet, _)| packet.finish(Some(&*keys.header.remote)).ok())
+        .and_then(|packet| {
+            open_initial(packet, &keys, Some(self.spaces[SpaceId::Initial].rx_packet))
+        })
+        .is_some();
+        if !opened {
+            debug!(
+                version,
+                "dropping unauthenticated packet of another version"
+            );
+            if self.crypto.switch_version(self.orig_version).is_err() {
+                error!("crypto session failed to switch back to the version it started with");
+            }
+            return false;
+        }
+        debug!(
+            from = self.version,
+            to = version,
+            "server negotiated a compatible version"
+        );
+        self.use_version(version);
+        true
+    }
+
+    /// Sends and receives `version`'s packets from now on, keeping the current version's
+    /// Initial keys for its packets in flight
+    fn use_version(&mut self, version: u32) {
+        let cid = self.retry_src_cid.unwrap_or(self.initial_dst_cid);
+        let keys = self.crypto.initial_keys(&cid, self.side.side());
+        self.orig_initial_crypto = self.spaces[SpaceId::Initial].crypto.replace(keys);
+        self.version = version;
+    }
+
+    /// The original version and its Initial keys, once the connection switched versions
+    fn orig_initial(&self) -> Option<(u32, &Keys)> {
+        self.orig_initial_crypto
+            .as_ref()
+            .map(|keys| (self.orig_version, keys))
     }
 
     fn handle_packet(
@@ -2339,6 +2771,8 @@ impl Connection {
                     None => trace_span!("recv", space = ?packet.header.space()),
                 };
                 let _guard = span.enter();
+                let len = packet.header_data.len() + packet.payload.len();
+                self.last_received = Some((packet.header.dst_cid(), len));
 
                 let is_duplicate = |n| self.spaces[packet.header.space()].dedup.insert(n);
                 if number.is_some_and(is_duplicate) {
@@ -2349,6 +2783,9 @@ impl Connection {
                     trace!("dropping short packet during handshake");
                     return;
                 } else {
+                    if packet.header_data[0] & FIXED_BIT == 0 {
+                        self.greased_packets_received += 1;
+                    }
                     if let Header::Initial(InitialHeader { ref token, .. }) = packet.header {
                         if let State::Handshake(ref hs) = self.state {
                             if self.side.is_server() && token != &hs.expected_token {
@@ -2508,7 +2945,7 @@ impl Connection {
                 self.rem_handshake_cid = rem_cid;
 
                 let space = &mut self.spaces[SpaceId::Initial];
-                if let Some(info) = space.take(0) {
+                if let Some(info) = space.take(self.config.initial_packet_number) {
                     self.on_packet_acked(now, info);
                 };
 
@@ -2655,6 +3092,9 @@ impl Connection {
                                 reason: "transport parameters missing".into(),
                             })?;
                     self.handle_peer_params(params)?;
+                    if let Some(version) = self.pending_version.take() {
+                        self.use_version(version);
+                    }
                     self.issue_first_cids(now);
                     self.init_0rtt();
                 }
@@ -2667,21 +3107,27 @@ impl Connection {
                 self.process_payload(now, remote, number.unwrap(), packet)?;
                 Ok(())
             }
-            Header::VersionNegotiate { .. } => {
+            Header::VersionNegotiate {
+                src_cid, dst_cid, ..
+            } => {
                 if self.total_authed_packets > 1 {
                     return Ok(());
                 }
-                let supported = packet
+                // RFC 9000 §17.2.1: the server echoes the connection IDs of the client's packet
+                if dst_cid != self.handshake_cid || src_cid != self.rem_handshake_cid {
+                    debug!("discarding Version Negotiation not echoing our connection IDs");
+                    return Ok(());
+                }
+                let versions = packet
                     .payload
-                    .chunks(4)
-                    .any(|x| match <[u8; 4]>::try_from(x) {
-                        Ok(version) => self.version == u32::from_be_bytes(version),
-                        Err(_) => false,
-                    });
-                if supported {
+                    .chunks_exact(4)
+                    .map(|x| u32::from_be_bytes(x.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                if versions.contains(&self.orig_version) {
                     return Ok(());
                 }
                 debug!("remote doesn't support our version");
+                self.server_versions = Some(versions);
                 Err(ConnectionError::VersionMismatch)
             }
             Header::Short { .. } => unreachable!(
@@ -2752,6 +3198,8 @@ impl Connection {
         number: u64,
         packet: Packet,
     ) -> Result<(), TransportError> {
+        let dst_cid = packet.header.dst_cid();
+        let received = packet.header_data.len() + packet.payload.len();
         let payload = packet.payload.freeze();
         let mut is_probing_packet = true;
         let mut close = None;
@@ -2822,7 +3270,7 @@ impl Connection {
                     close = Some(reason);
                 }
                 Frame::PathChallenge(token) => {
-                    self.path_responses.push(number, token, remote);
+                    self.path_responses.push(number, token, remote, received);
                     if remote == self.path.remote {
                         // PATH_CHALLENGE on active path, possible off-path packet forwarding
                         // attack. Send a non-probing packet to recover the active path.
@@ -2834,14 +3282,35 @@ impl Connection {
                 }
                 Frame::PathResponse(token) => {
                     if self.path.challenge == Some(token) && remote == self.path.remote {
-                        trace!("new path validated");
                         self.timers.stop(Timer::PathValidation);
                         self.path.challenge = None;
+                        // A challenge held under 1200 bytes leaves the path's MTU unvalidated: a
+                        // second one, padded in full, validates it (RFC 9000 §8.2.1)
+                        if mem::take(&mut self.path.challenge_undersized) {
+                            self.path.mtu_challenge = Some(self.rng.random());
+                            self.path.mtu_challenge_pending = true;
+                            self.timers
+                                .set(Timer::PathValidation, now + 3 * self.pto(SpaceId::Data));
+                        }
                         self.path.validated = true;
+                        trace!("new path validated");
                         if let Some((_, ref mut prev_path)) = self.prev_path {
                             prev_path.challenge = None;
                             prev_path.challenge_pending = false;
                         }
+                        if self
+                            .prev_path
+                            .as_ref()
+                            .is_none_or(|(_, prev_path)| prev_path.remote != remote)
+                        {
+                            self.peer_migrations += 1;
+                            self.peer_cid_migrations += u64::from(self.migrating_cid);
+                            self.peer_migrated_cid = self.migrating_cid;
+                        }
+                    } else if self.path.mtu_challenge == Some(token) && remote == self.path.remote {
+                        self.timers.stop(Timer::PathValidation);
+                        self.path.mtu_challenge = None;
+                        trace!("path MTU validated");
                     } else {
                         debug!(token, "ignoring invalid PATH_RESPONSE");
                     }
@@ -2860,6 +3329,18 @@ impl Connection {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }
                 }
+                Frame::ResetStreamAt(frame) => {
+                    if !self.config.reset_stream_at {
+                        return Err(frame::InvalidFrame {
+                            ty: Some(frame::FrameType::RESET_STREAM_AT),
+                            reason: "invalid frame ID",
+                        }
+                        .into());
+                    }
+                    if self.streams.received_reset_at(frame)?.should_transmit() {
+                        self.spaces[SpaceId::Data].pending.max_data = true;
+                    }
+                }
                 Frame::DataBlocked { offset } => {
                     debug!(offset, "peer claims to be blocked at connection level");
                 }
@@ -2870,6 +3351,7 @@ impl Connection {
                             "STREAM_DATA_BLOCKED on send-only stream",
                         ));
                     }
+                    self.streams.check_remote_limit(id)?;
                     debug!(
                         stream = %id,
                         offset, "peer claims to be blocked at stream level"
@@ -2899,7 +3381,7 @@ impl Connection {
                             "STOP_SENDING on unopened stream",
                         ));
                     }
-                    self.streams.received_stop_sending(id, error_code);
+                    self.streams.received_stop_sending(id, error_code)?;
                 }
                 Frame::RetireConnectionId { sequence } => {
                     let allow_more_cids = self
@@ -2981,6 +3463,10 @@ impl Connection {
                     }
                 }
                 Frame::AckFrequency(ack_frequency) => {
+                    let ack_frequency = match self.config.ack_frequency_draft_00 {
+                        true => ack_frequency.decode_draft_00()?,
+                        false => ack_frequency,
+                    };
                     // This frame can only be sent in the Data space
                     let space = &mut self.spaces[SpaceId::Data];
 
@@ -3055,9 +3541,13 @@ impl Connection {
                 "migration-initiating packets should have been dropped immediately"
             );
             self.migrate(now, remote);
+            self.migrating_cid = self.path_cid != Some(dst_cid);
             // Break linkability, if possible
             self.update_rem_cid();
             self.spin = false;
+        }
+        if !is_probing_packet && number == self.spaces[SpaceId::Data].rx_packet {
+            self.path_cid = Some(dst_cid);
         }
 
         Ok(())
@@ -3203,6 +3693,7 @@ impl Connection {
                 buf,
                 &mut self.stats,
                 max_size,
+                self.config.ack_delay_exponent,
             );
         }
 
@@ -3238,12 +3729,15 @@ impl Connection {
 
         // PATH_CHALLENGE
         if buf.len() + 9 < max_size && space_id == SpaceId::Data {
-            // Transmit challenges with every outgoing frame on an unvalidated path
-            if let Some(token) = self.path.challenge {
+            // Transmit challenges with every outgoing frame on an unvalidated path, or one whose
+            // MTU is being validated
+            if let Some(token) = self.path.challenge.or(self.path.mtu_challenge) {
                 // But only send a packet solely for that purpose at most once
                 self.path.challenge_pending = false;
+                self.path.mtu_challenge_pending = false;
                 sent.non_retransmits = true;
                 sent.requires_padding = true;
+                sent.path_challenge = true;
                 trace!("PATH_CHALLENGE {:08x}", token);
                 buf.write(frame::FrameType::PATH_CHALLENGE);
                 buf.write(token);
@@ -3312,6 +3806,8 @@ impl Connection {
                 &mut sent.retransmits,
                 &mut self.stats.frame_tx,
                 max_size,
+                now,
+                self.path.rtt.get(),
             );
         }
 
@@ -3432,6 +3928,7 @@ impl Connection {
                 buf,
                 &mut self.stats,
                 max_size,
+                self.config.ack_delay_exponent,
             );
         }
 
@@ -3453,6 +3950,7 @@ impl Connection {
         buf: &mut Vec<u8>,
         stats: &mut ConnectionStats,
         max_size: usize,
+        ack_delay_exponent: u8,
     ) {
         debug_assert!(!space.pending_acks.ranges().is_empty());
 
@@ -3466,9 +3964,7 @@ impl Connection {
 
         let delay_micros = space.pending_acks.ack_delay(now).as_micros() as u64;
 
-        // TODO: This should come from `TransportConfig` if that gets configurable.
-        let ack_delay_exp = TransportParameters::default().ack_delay_exponent;
-        let delay = delay_micros >> ack_delay_exp.into_inner();
+        let delay = delay_micros >> ack_delay_exponent;
 
         trace!(
             "ACK {:?}, Delay = {}us",
@@ -3510,10 +4006,37 @@ impl Connection {
                 "CID authentication failure",
             ));
         }
+        self.validate_version_information(&params)?;
 
         self.set_peer_params(params);
 
         Ok(())
+    }
+
+    /// Checks the peer's version_information against the versions the connection used (RFC 9368
+    /// §4): a client's chose the original version and offers any the server switches to, and a
+    /// server's chose the version in use (one the client offered, as it switched to it)
+    fn validate_version_information(
+        &self,
+        params: &TransportParameters,
+    ) -> Result<(), TransportError> {
+        let info = params.version_information.as_ref();
+        let valid = match &self.side {
+            ConnectionSide::Server { .. } => match self.pending_version {
+                Some(negotiated) => info.is_some_and(|info| {
+                    info.chosen == self.orig_version && info.available.contains(&negotiated)
+                }),
+                None => info.is_none_or(|info| info.chosen == self.orig_version),
+            },
+            ConnectionSide::Client { .. } => match info {
+                Some(info) => info.chosen == self.version,
+                None => self.version == self.orig_version,
+            },
+        };
+        match valid {
+            true => Ok(()),
+            false => Err(TransportError::VERSION_NEGOTIATION_ERROR("")),
+        }
     }
 
     fn set_peer_params(&mut self, params: TransportParameters) {
@@ -3545,6 +4068,7 @@ impl Connection {
             packet,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.orig_initial(),
             self.key_phase,
             self.prev_crypto.as_ref(),
             self.next_crypto.as_ref(),
@@ -3633,6 +4157,7 @@ impl Connection {
             first_decode.clone(),
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.orig_initial(),
             self.peer_params.stateless_reset_token,
         )?;
 
@@ -3641,6 +4166,7 @@ impl Connection {
             &mut packet,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.orig_initial(),
             self.key_phase,
             self.prev_crypto.as_ref(),
             self.next_crypto.as_ref(),
@@ -3721,6 +4247,7 @@ impl Connection {
     fn can_send_1rtt(&self, max_size: usize) -> bool {
         self.streams.can_send_stream_data()
             || self.path.challenge_pending
+            || self.path.mtu_challenge_pending
             || self
                 .prev_path
                 .as_ref()
@@ -3765,9 +4292,10 @@ impl Connection {
     /// latency and packet loss.
     fn predict_1rtt_overhead(&self, pn: Option<u64>) -> usize {
         let pn_len = match pn {
-            Some(pn) => PacketNumber::new(
+            Some(pn) => PacketNumber::new_with_min_len(
                 pn,
                 self.spaces[SpaceId::Data].largest_acked_packet.unwrap_or(0),
+                self.config.min_packet_number_len,
             )
             .len(),
             // Upper bound
@@ -3818,6 +4346,8 @@ enum ConnectionSide {
         token: Bytes,
         token_store: Arc<dyn TokenStore>,
         server_name: String,
+        /// The versions its version_information offers, the server may switch it to
+        available_versions: Vec<u32>,
     },
     Server {
         server_config: Arc<ServerConfig>,
@@ -3854,16 +4384,14 @@ impl From<SideArgs> for ConnectionSide {
             SideArgs::Client {
                 token_store,
                 server_name,
+                available_versions,
             } => Self::Client {
                 token: token_store.take(&server_name).unwrap_or_default(),
                 token_store,
                 server_name,
+                available_versions,
             },
-            SideArgs::Server {
-                server_config,
-                pref_addr_cid: _,
-                path_validated: _,
-            } => Self::Server { server_config },
+            SideArgs::Server { server_config, .. } => Self::Server { server_config },
         }
     }
 }
@@ -3873,11 +4401,15 @@ pub(crate) enum SideArgs {
     Client {
         token_store: Arc<dyn TokenStore>,
         server_name: String,
+        /// The versions its version_information offers
+        available_versions: Vec<u32>,
     },
     Server {
         server_config: Arc<ServerConfig>,
         pref_addr_cid: Option<ConnectionId>,
         path_validated: bool,
+        /// The version it switches to from the client's (see [`ServerConfig::preferred_version`])
+        negotiated_version: Option<u32>,
     },
 }
 
@@ -4085,6 +4617,8 @@ struct SentFrames {
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
     requires_padding: bool,
+    /// Whether the packet contains the path's PATH_CHALLENGE
+    path_challenge: bool,
 }
 
 impl SentFrames {
@@ -4116,6 +4650,92 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "rustls-ring")]
+    #[test]
+    fn large_initial_token_leaves_room_for_close() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let config = crate::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        // With 40 bytes of header overhead, a 16-byte tag, and a 35-byte ACK,
+        // a 1084-byte token leaves exactly ConnectionClose::SIZE_BOUND bytes.
+        for (token_len, ack_fits) in [
+            (1083, true),
+            (1084, true),
+            (1085, false),
+            (1100, false),
+            // Exactly enough frame space for CONNECTION_CLOSE alone.
+            (1119, false),
+        ] {
+            config
+                .token_store
+                .insert("localhost", vec![0; token_len].into());
+            let mut endpoint =
+                crate::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+            let now = Instant::now();
+            let (_, mut conn) = endpoint
+                .connect(
+                    now,
+                    config.clone(),
+                    "[::1]:4433".parse().unwrap(),
+                    "localhost",
+                )
+                .unwrap();
+            let keys = conn
+                .crypto
+                .initial_keys(&conn.initial_dst_cid, Side::Server);
+            let space = &mut conn.spaces[SpaceId::Initial];
+            for pn in (0..32).step_by(2) {
+                space.pending_acks.insert_one(pn, now);
+                space.dedup.insert(pn);
+                space
+                    .pending_acks
+                    .packet_received(now, pn, true, &space.dedup);
+            }
+            conn.close(now, 0u32.into(), Bytes::new());
+            let mut buf = Vec::new();
+            assert!(conn.poll_transmit(now, 1, &mut buf).is_some());
+            assert!(buf.len() <= 1200);
+            assert!(!conn.close);
+
+            let (packet, rest) = PartialDecode::new(
+                buf.as_slice().into(),
+                &FixedLengthConnectionIdParser::new(0),
+                crate::DEFAULT_SUPPORTED_VERSIONS,
+                false,
+            )
+            .unwrap();
+            assert!(rest.is_none());
+            let mut packet = packet.finish(Some(&*keys.header.remote)).unwrap();
+            assert_eq!(packet.header_data.len(), 40 + token_len);
+            keys.packet
+                .remote
+                .decrypt(0, &packet.header_data, &mut packet.payload)
+                .unwrap();
+            let mut frames = frame::Iter::new(packet.payload.freeze())
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|frame| !matches!(frame, Frame::Padding));
+            if ack_fits {
+                assert!(
+                    matches!(frames.next(), Some(Frame::Ack(_))),
+                    "token {token_len}"
+                );
+            }
+            assert!(
+                matches!(
+                    frames.next(),
+                    Some(Frame::Close(Close::Connection(frame::ConnectionClose {
+                        error_code: TransportErrorCode::APPLICATION_ERROR,
+                        ..
+                    })))
+                ),
+                "token {token_len}"
+            );
+            assert!(frames.next().is_none());
+        }
+    }
 
     #[test]
     fn negotiate_max_idle_timeout_commutative() {

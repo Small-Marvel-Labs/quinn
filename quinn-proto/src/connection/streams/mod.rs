@@ -50,6 +50,7 @@ impl<'a> Streams<'a> {
 
         // TODO: Queue STREAM_ID_BLOCKED if this fails
         if self.state.next[dir as usize] >= self.state.max[dir as usize] {
+            self.state.open_blocked[dir as usize] = true;
             return None;
         }
 
@@ -70,12 +71,14 @@ impl<'a> Streams<'a> {
         }
 
         let x = self.state.next_reported_remote[dir as usize];
+        let id = StreamId::new(!self.state.side, dir, x);
+        self.state.insert_remote_through(id);
         self.state.next_reported_remote[dir as usize] = x + 1;
         if dir == Dir::Bi {
             self.state.send_streams += 1;
         }
 
-        Some(StreamId::new(!self.state.side, dir, x))
+        Some(id)
     }
 
     #[cfg(fuzzing)]
@@ -94,7 +97,7 @@ impl<'a> Streams<'a> {
     /// These streams count against the respective concurrency limit reported by
     /// [`Connection::max_concurrent_streams`](super::Connection::max_concurrent_streams).
     pub fn remote_open_streams(&self, dir: Dir) -> u64 {
-        // total opened - total closed = total opened - ( total permitted - total permitted unclosed )
+        // total opened - total closed = total opened - ( total granted - total granted unclosed )
         self.state.next_remote[dir as usize]
             - (self.state.max_remote[dir as usize]
                 - self.state.allocated_remote_count[dir as usize])
@@ -138,7 +141,11 @@ impl RecvStream<'_> {
             hash_map::Entry::Occupied(s) => s,
             hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
         };
-        let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
+        let stream = get_or_insert_recv(
+            self.state
+                .stream_receive_window
+                .of(self.state.side, self.id),
+        )(entry.get_mut());
 
         let (read_credits, stop_sending) = stream.stop()?;
         if stop_sending.should_transmit() {
@@ -161,6 +168,39 @@ impl RecvStream<'_> {
         }
 
         Ok(())
+    }
+
+    /// Stop accepting data as [`stop`](Self::stop) does, learning how the peer ends the stream:
+    /// with its RESET_STREAM's error code, or `None` by sending all of it
+    ///
+    /// Returns that end if the peer already ended the stream, else a [`StreamEvent::StoppedEnded`]
+    /// reports it. A stream already stopped whose state is kept has its end still to come, which
+    /// is then awaited.
+    pub fn stop_awaiting_end(
+        &mut self,
+        error_code: VarInt,
+    ) -> Result<Option<Option<VarInt>>, ClosedStream> {
+        let ended = match self.state.recv.get_mut(&self.id) {
+            Some(stream) => match stream.as_mut().and_then(|s| s.as_open_recv_mut()) {
+                Some(stream) if stream.stopped => {
+                    stream.awaiting_end = true;
+                    return Ok(None);
+                }
+                Some(stream) => stream.ended(),
+                None => None,
+            },
+            None => return Err(ClosedStream { _private: () }),
+        };
+        self.stop(error_code)?;
+        if let Some(stream) = self
+            .state
+            .recv
+            .get_mut(&self.id)
+            .and_then(|s| s.as_mut()?.as_open_recv_mut())
+        {
+            stream.awaiting_end = true;
+        }
+        Ok(ended)
     }
 
     /// Check whether this stream has been reset by the peer, returning the reset error code if so
@@ -336,7 +376,10 @@ impl<'a> SendStream<'a> {
             .map(get_or_insert_send(max_send_data))
             .ok_or(ClosedStream { _private: () })?;
 
-        if matches!(stream.state, SendState::ResetSent) {
+        if matches!(
+            stream.state,
+            SendState::ResetSent | SendState::ResetAt { .. }
+        ) {
             // Redundant reset call
             return Err(ClosedStream { _private: () });
         }
@@ -349,6 +392,40 @@ impl<'a> SendStream<'a> {
         self.pending.reset_stream.push((self.id, error_code));
 
         // Don't reopen an already-closed stream we haven't forgotten yet
+        Ok(())
+    }
+
+    /// Abandon transmitting data on a stream past `reliable_size` with RESET_STREAM_AT
+    /// (draft-ietf-quic-reliable-stream-reset): the data before it is still delivered, and the
+    /// stream ends once it and the reset are acknowledged
+    ///
+    /// Resets the stream as [`reset()`](Self::reset) does if `reliable_size` is 0, or unless the
+    /// peer announced it can receive RESET_STREAM_AT. A `reliable_size` past the data written is
+    /// all of it.
+    ///
+    /// # Panics
+    /// - when applied to a receive stream
+    pub fn reset_at(&mut self, error_code: VarInt, reliable_size: u64) -> Result<(), ClosedStream> {
+        if reliable_size == 0 || !self.state.reset_stream_at {
+            return self.reset(error_code);
+        }
+        let max_send_data = self.state.max_send_data(self.id);
+        let stream = self
+            .state
+            .send
+            .get_mut(&self.id)
+            .map(get_or_insert_send(max_send_data))
+            .ok_or(ClosedStream { _private: () })?;
+
+        if !matches!(stream.state, SendState::Ready | SendState::DataSent { .. }) {
+            return Err(ClosedStream { _private: () });
+        }
+
+        // Restore the portion of the send window consumed by the data past the reliable size
+        let buffered = stream.pending.buffered();
+        stream.reset_at(reliable_size);
+        self.state.buffered_data -= buffered - stream.pending.buffered();
+        self.pending.reset_stream.push((self.id, error_code));
         Ok(())
     }
 
@@ -502,6 +579,13 @@ pub enum StreamEvent {
         id: StreamId,
         /// Error code supplied by the peer
         error_code: VarInt,
+    },
+    /// The peer ended a stream stopped with [`RecvStream::stop_awaiting_end`]
+    StoppedEnded {
+        /// Which stream ended
+        id: StreamId,
+        /// The error code of the peer's RESET_STREAM, or `None` if it sent all of the stream
+        reset: Option<VarInt>,
     },
     /// At least one new stream of a certain directionality may be opened
     Available {

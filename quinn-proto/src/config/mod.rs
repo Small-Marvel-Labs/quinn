@@ -23,11 +23,13 @@ use crate::{
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
     shared::ConnectionId,
+    transport_parameters::VersionInformation,
 };
 
 mod transport;
 #[cfg(feature = "qlog")]
 pub use transport::QlogConfig;
+pub(crate) use transport::StreamReceiveWindows;
 pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
 
 /// Global configuration for the endpoint, affecting all connections
@@ -226,6 +228,8 @@ pub struct ServerConfig {
     pub(crate) incoming_buffer_size_total: u64,
 
     pub(crate) time_source: Arc<dyn TimeSource>,
+
+    pub(crate) preferred_version: Option<u32>,
 }
 
 impl ServerConfig {
@@ -253,6 +257,8 @@ impl ServerConfig {
             incoming_buffer_size_total: 100 << 20,
 
             time_source: Arc::new(StdSystemTime),
+
+            preferred_version: None,
         }
     }
 
@@ -368,6 +374,16 @@ impl ServerConfig {
         self
     }
 
+    /// A version a connection switches to from a compatible one its client chose, when the
+    /// version_information transport parameter in the client's first flight offers it
+    /// (compatible version negotiation, RFC 9368)
+    ///
+    /// Defaults to `None`, keeping the client's version.
+    pub fn preferred_version(&mut self, version: Option<u32>) -> &mut Self {
+        self.preferred_version = version;
+        self
+    }
+
     pub(crate) fn has_preferred_address(&self) -> bool {
         self.preferred_address_v4.is_some() || self.preferred_address_v6.is_some()
     }
@@ -421,6 +437,7 @@ impl fmt::Debug for ServerConfig {
             .field("preferred_address_v4", &self.preferred_address_v4)
             .field("preferred_address_v6", &self.preferred_address_v6)
             .field("max_incoming", &self.max_incoming)
+            .field("preferred_version", &self.preferred_version)
             .field("incoming_buffer_size", &self.incoming_buffer_size)
             .field(
                 "incoming_buffer_size_total",
@@ -563,8 +580,14 @@ pub struct ClientConfig {
     /// Provider that populates the destination connection ID of Initial Packets
     pub(crate) initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
 
+    /// Generator factory for the connection's own connection IDs, if not the endpoint's
+    pub(crate) cid_generator: Option<Arc<dyn Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync>>,
+
     /// QUIC protocol version to use
     pub(crate) version: u32,
+
+    /// Versions offered in the version_information transport parameter, if not `version` alone
+    pub(crate) available_versions: Option<Vec<u32>>,
 }
 
 impl ClientConfig {
@@ -577,7 +600,9 @@ impl ClientConfig {
             initial_dst_cid_provider: Arc::new(|| {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
+            cid_generator: None,
             version: 1,
+            available_versions: None,
         }
     }
 
@@ -594,6 +619,24 @@ impl ClientConfig {
         initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
     ) -> &mut Self {
         self.initial_dst_cid_provider = initial_dst_cid_provider;
+        self
+    }
+
+    /// Supply a connection ID generator factory for the connection's own connection IDs
+    ///
+    /// Called once for the connection to obtain the generator of its initial source connection ID
+    /// and of those it issues later, in place of the endpoint's (see
+    /// [`EndpointConfig::cid_generator`]), so a connection can use IDs of another length, zero
+    /// included. The endpoint routes packets to connections of each length it serves; like any
+    /// connection using zero-length IDs, one must be the endpoint's only such connection to its
+    /// remote address.
+    ///
+    /// Defaults to `None`, using the endpoint's generator.
+    pub fn cid_generator<F: Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync + 'static>(
+        &mut self,
+        factory: F,
+    ) -> &mut Self {
+        self.cid_generator = Some(Arc::new(factory));
         self
     }
 
@@ -615,6 +658,27 @@ impl ClientConfig {
     pub fn version(&mut self, version: u32) -> &mut Self {
         self.version = version;
         self
+    }
+
+    /// Set the versions the connection offers, in order of preference, in its
+    /// version_information transport parameter: the server may switch it to one compatible
+    /// with [`Self::version`] (compatible version negotiation, RFC 9368)
+    ///
+    /// The crypto session must be able to switch to it ([`crypto::Session::switch_version`]).
+    /// Defaults to `None`, offering [`Self::version`] alone.
+    pub fn available_versions(&mut self, versions: Option<Vec<u32>>) -> &mut Self {
+        self.available_versions = versions;
+        self
+    }
+
+    pub(crate) fn version_information(&self) -> VersionInformation {
+        VersionInformation {
+            chosen: self.version,
+            available: self
+                .available_versions
+                .clone()
+                .unwrap_or_else(|| vec![self.version]),
+        }
     }
 }
 
@@ -652,6 +716,7 @@ impl fmt::Debug for ClientConfig {
             // crypto not debug
             // token_store not debug
             .field("version", &self.version)
+            .field("available_versions", &self.available_versions)
             .finish_non_exhaustive()
     }
 }

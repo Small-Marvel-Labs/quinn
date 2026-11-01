@@ -24,6 +24,13 @@ pub(super) struct PathData {
     pub(super) pacing: Pacer,
     pub(super) challenge: Option<u64>,
     pub(super) challenge_pending: bool,
+    /// Whether a datagram carrying `challenge` was held under 1200 bytes by the
+    /// anti-amplification limit, so its response leaves the path's MTU unvalidated
+    pub(super) challenge_undersized: bool,
+    /// The challenge validating the MTU of a path validated by an undersized one (RFC 9000
+    /// §8.2.1): the path counts as validated meanwhile, and stays if it goes unanswered
+    pub(super) mtu_challenge: Option<u64>,
+    pub(super) mtu_challenge_pending: bool,
     /// Whether we're certain the peer can both send and receive on this address
     ///
     /// Initially equal to `use_stateless_retry` for servers, and becomes false again on every
@@ -80,6 +87,9 @@ impl PathData {
             congestion,
             challenge: None,
             challenge_pending: false,
+            challenge_undersized: false,
+            mtu_challenge: None,
+            mtu_challenge_pending: false,
             validated: false,
             total_sent: 0,
             total_recvd: 0,
@@ -123,6 +133,9 @@ impl PathData {
             congestion,
             challenge: None,
             challenge_pending: false,
+            challenge_undersized: false,
+            mtu_challenge: None,
+            mtu_challenge_pending: false,
             validated: false,
             total_sent: 0,
             total_recvd: 0,
@@ -360,13 +373,14 @@ pub(crate) struct PathResponses {
 }
 
 impl PathResponses {
-    pub(crate) fn push(&mut self, packet: u64, token: u64, remote: SocketAddr) {
+    pub(crate) fn push(&mut self, packet: u64, token: u64, remote: SocketAddr, received: usize) {
         /// Arbitrary permissive limit to prevent abuse
         const MAX_PATH_RESPONSES: usize = 16;
         let response = PathResponse {
             packet,
             token,
             remote,
+            received,
         };
         let existing = self.pending.iter_mut().find(|x| x.remote == remote);
         if let Some(existing) = existing {
@@ -385,7 +399,7 @@ impl PathResponses {
         }
     }
 
-    pub(crate) fn pop_off_path(&mut self, remote: SocketAddr) -> Option<(u64, SocketAddr)> {
+    pub(crate) fn pop_off_path(&mut self, remote: SocketAddr) -> Option<(u64, SocketAddr, usize)> {
         let response = *self.pending.last()?;
         if response.remote == remote {
             // We don't bother searching further because we expect that the on-path response will
@@ -393,7 +407,7 @@ impl PathResponses {
             return None;
         }
         self.pending.pop();
-        Some((response.token, response.remote))
+        Some((response.token, response.remote, response.received))
     }
 
     pub(crate) fn pop_on_path(&mut self, remote: SocketAddr) -> Option<u64> {
@@ -419,6 +433,8 @@ struct PathResponse {
     token: u64,
     /// The address the corresponding PATH_CHALLENGE was received from
     remote: SocketAddr,
+    /// The size of the packet the corresponding PATH_CHALLENGE was received in
+    received: usize,
 }
 
 /// Summary statistics of packets that have been sent on a particular path, but which have not yet

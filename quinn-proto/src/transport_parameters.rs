@@ -19,7 +19,6 @@ use crate::{
     LOC_CID_COUNT, MAX_CID_SIZE, MAX_STREAM_COUNT, RESET_TOKEN_SIZE, ResetToken, Side,
     TIMER_GRANULARITY, TransportError, VarInt,
     cid_generator::ConnectionIdGenerator,
-    cid_queue::CidQueue,
     coding::{BufExt, BufMutExt, UnexpectedEnd},
     config::{EndpointConfig, ServerConfig, TransportConfig},
     shared::ConnectionId,
@@ -67,7 +66,7 @@ macro_rules! apply_params {
 macro_rules! make_struct {
     {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
         /// Transport parameters used to negotiate connection-level preferences between peers
-        #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+        #[derive(Debug, Clone, Eq, PartialEq)]
         pub struct TransportParameters {
             $($(#[$doc])* pub(crate) $name : VarInt,)*
 
@@ -88,6 +87,15 @@ macro_rules! make_struct {
             /// If a value is provided, it implies that the endpoint supports QUIC Acknowledgement
             /// Frequency
             pub(crate) min_ack_delay: Option<VarInt>,
+
+            /// The endpoint can receive RESET_STREAM_AT frames (draft-ietf-quic-reliable-stream-reset)
+            ///
+            /// Only read: quinn doesn't send this parameter.
+            pub(crate) reset_stream_at: bool,
+
+            /// The version the endpoint chose for the connection, and those it offers or deploys
+            /// (RFC 9368)
+            pub(crate) version_information: Option<VersionInformation>,
 
             // Server-only
             /// The value of the Destination Connection ID field from the first Initial packet sent
@@ -126,6 +134,8 @@ macro_rules! make_struct {
                     initial_src_cid: None,
                     grease_quic_bit: false,
                     min_ack_delay: None,
+                    reset_stream_at: false,
+                    version_information: None,
 
                     original_dst_cid: None,
                     retry_src_cid: None,
@@ -148,6 +158,7 @@ impl TransportParameters {
         cid_gen: &dyn ConnectionIdGenerator,
         initial_src_cid: ConnectionId,
         server_config: Option<&ServerConfig>,
+        version_information: VersionInformation,
         rng: &mut impl Rng,
     ) -> Self {
         Self {
@@ -155,16 +166,24 @@ impl TransportParameters {
             initial_max_streams_bidi: config.max_concurrent_bidi_streams,
             initial_max_streams_uni: config.max_concurrent_uni_streams,
             initial_max_data: config.receive_window,
-            initial_max_stream_data_bidi_local: config.stream_receive_window,
-            initial_max_stream_data_bidi_remote: config.stream_receive_window,
-            initial_max_stream_data_uni: config.stream_receive_window,
+            initial_max_stream_data_bidi_local: config
+                .stream_receive_window_bidi_local
+                .unwrap_or(config.stream_receive_window),
+            initial_max_stream_data_bidi_remote: config
+                .stream_receive_window_bidi_remote
+                .unwrap_or(config.stream_receive_window),
+            initial_max_stream_data_uni: config
+                .stream_receive_window_uni
+                .unwrap_or(config.stream_receive_window),
             max_udp_payload_size: endpoint_config.max_udp_payload_size,
             max_idle_timeout: config.max_idle_timeout.unwrap_or(VarInt(0)),
+            ack_delay_exponent: config.ack_delay_exponent.into(),
+            max_ack_delay: VarInt::from_u64(config.max_ack_delay.as_millis() as u64).unwrap(),
             disable_active_migration: server_config.is_some_and(|c| !c.migration),
             active_connection_id_limit: if cid_gen.cid_len() == 0 {
                 2 // i.e. default, i.e. unsent
             } else {
-                CidQueue::LEN as u32
+                config.active_connection_id_limit
             }
             .into(),
             max_datagram_frame_size: config
@@ -172,8 +191,9 @@ impl TransportParameters {
                 .map(|x| (x.min(u16::MAX.into()) as u16).into()),
             grease_quic_bit: endpoint_config.grease_quic_bit,
             min_ack_delay: Some(
-                VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap(),
+                VarInt::from_u64(u64::try_from(config.min_ack_delay.as_micros()).unwrap()).unwrap(),
             ),
+            version_information: Some(version_information),
             grease_transport_parameter: Some(ReservedTransportParameter::random(rng)),
             write_order: Some({
                 let mut order = std::array::from_fn(|i| i as u8);
@@ -275,6 +295,43 @@ impl PreferredAddress {
             connection_id: cid,
             stateless_reset_token: token.into(),
         })
+    }
+}
+
+/// Version Information (RFC 9368 §3): the version its sender chose for the connection, and the
+/// versions it offers, in order of preference (a client), or deploys (a server)
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct VersionInformation {
+    pub(crate) chosen: u32,
+    pub(crate) available: Vec<u32>,
+}
+
+impl VersionInformation {
+    fn write<W: BufMut>(&self, w: &mut W) {
+        w.write_var(TransportParameterId::VersionInformation as u64);
+        w.write_var(4 * (1 + self.available.len() as u64));
+        w.write(self.chosen);
+        for &version in &self.available {
+            w.write(version);
+        }
+    }
+
+    /// Reads one `len` bytes long, a client's when `side` is the server (RFC 9368 §4)
+    fn read<R: Buf>(r: &mut R, len: usize, side: Side) -> Result<Self, Error> {
+        if len < 4 || len % 4 != 0 {
+            return Err(Error::Malformed);
+        }
+        let chosen = r.get::<u32>()?;
+        let available = (1..len / 4)
+            .map(|_| r.get::<u32>())
+            .collect::<Result<Vec<_>, _>>()?;
+        if chosen == 0
+            || available.contains(&0)
+            || (side.is_server() && !available.contains(&chosen))
+        {
+            return Err(Error::IllegalValue);
+        }
+        Ok(Self { chosen, available })
     }
 }
 
@@ -380,6 +437,11 @@ impl TransportParameters {
                         w.write(x);
                     }
                 }
+                TransportParameterId::VersionInformation => {
+                    if let Some(info) = &self.version_information {
+                        info.write(w);
+                    }
+                }
                 id => {
                     macro_rules! write_params {
                         {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
@@ -430,6 +492,9 @@ impl TransportParameters {
             }
             let len = len as usize;
             let Ok(id) = TransportParameterId::try_from(id) else {
+                // reset_stream_at, as draft-ietf-quic-reliable-stream-reset-08 and its drafts 05
+                // to 07 number it
+                params.reset_stream_at |= matches!(id, 0x1d | 0x17f7586d2cb571);
                 // unknown transport parameters are ignored
                 r.advance(len);
                 continue;
@@ -478,6 +543,12 @@ impl TransportParameters {
                     _ => return Err(Error::Malformed),
                 },
                 TransportParameterId::MinAckDelayDraft07 => params.min_ack_delay = Some(r.get()?),
+                TransportParameterId::VersionInformation => {
+                    if params.version_information.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    params.version_information = Some(VersionInformation::read(r, len, side)?);
+                }
                 _ => {
                     macro_rules! parse {
                         {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
@@ -633,6 +704,9 @@ pub(crate) enum TransportParameterId {
     InitialSourceConnectionId = 0x0F,
     RetrySourceConnectionId = 0x10,
 
+    // https://www.rfc-editor.org/rfc/rfc9368.html#section-3
+    VersionInformation = 0x11,
+
     // Smallest possible ID of reserved transport parameter https://datatracker.ietf.org/doc/html/rfc9000#section-22.3
     ReservedTransportParameter = 0x1B,
 
@@ -648,7 +722,7 @@ pub(crate) enum TransportParameterId {
 
 impl TransportParameterId {
     /// Array with all supported transport parameter IDs
-    const SUPPORTED: [Self; 21] = [
+    const SUPPORTED: [Self; 22] = [
         Self::MaxIdleTimeout,
         Self::MaxUdpPayloadSize,
         Self::InitialMaxData,
@@ -668,6 +742,7 @@ impl TransportParameterId {
         Self::OriginalDestinationConnectionId,
         Self::InitialSourceConnectionId,
         Self::RetrySourceConnectionId,
+        Self::VersionInformation,
         Self::GreaseQuicBit,
         Self::MinAckDelayDraft07,
     ];
@@ -707,6 +782,7 @@ impl TryFrom<u64> for TransportParameterId {
             }
             id if Self::InitialSourceConnectionId == id => Self::InitialSourceConnectionId,
             id if Self::RetrySourceConnectionId == id => Self::RetrySourceConnectionId,
+            id if Self::VersionInformation == id => Self::VersionInformation,
             id if Self::GreaseQuicBit == id => Self::GreaseQuicBit,
             id if Self::MinAckDelayDraft07 == id => Self::MinAckDelayDraft07,
             _ => return Err(()),

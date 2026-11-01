@@ -46,6 +46,12 @@ impl SendStream {
         }
     }
 
+    /// Whether this client stream was opened in 0-RTT, before the handshake completed: the
+    /// server may reject the data sent on it (see [`WriteError::ZeroRttRejected`])
+    pub fn is_0rtt(&self) -> bool {
+        self.is_0rtt
+    }
+
     /// Write a buffer into this stream, returning how many bytes were written
     ///
     /// Unless this method errors, it waits until some amount of `buf` can be written into this
@@ -206,6 +212,27 @@ impl SendStream {
             return Ok(());
         }
         conn.inner.send_stream(self.stream).reset(error_code)?;
+        conn.wake();
+        Ok(())
+    }
+
+    /// Close the send stream immediately past `reliable_size` with RESET_STREAM_AT
+    /// (draft-ietf-quic-reliable-stream-reset)
+    ///
+    /// No new data can be written after calling this method. The data before `reliable_size` is
+    /// still delivered (retransmitted if lost), and the data past it dropped. A plain
+    /// [`reset()`](Self::reset) if `reliable_size` is 0, or unless the peer announced it can
+    /// receive RESET_STREAM_AT.
+    ///
+    /// May fail as [`reset()`](Self::reset) may.
+    pub fn reset_at(&mut self, error_code: VarInt, reliable_size: u64) -> Result<(), ClosedStream> {
+        let mut conn = self.conn.state.lock("SendStream::reset_at");
+        if self.is_0rtt && conn.check_0rtt().is_err() {
+            return Ok(());
+        }
+        conn.inner
+            .send_stream(self.stream)
+            .reset_at(error_code, reliable_size)?;
         conn.wake();
         Ok(())
     }

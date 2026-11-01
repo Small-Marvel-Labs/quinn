@@ -168,19 +168,18 @@ fn version_negotiate_client() {
         .unwrap();
     let now = Instant::now();
     let mut buf = Vec::with_capacity(client.config().get_max_udp_payload_size() as usize);
-    let opt_event = client.handle(
-        now,
-        server_addr,
-        None,
-        None,
-        // Version negotiation packet for reserved version, with empty DCID
-        hex!(
-            "80 00000000 00 04 00000000
-             0a1a2a3a"
-        )[..]
-            .into(),
-        &mut buf,
-    );
+    // The client's first Initial, whose destination connection ID the server echoes as the
+    // Version Negotiation packet's source connection ID (RFC 9000 §17.2.1)
+    let mut initial = Vec::new();
+    client_ch.poll_transmit(now, 1, &mut initial).unwrap();
+    let client_dcid = &initial[6..6 + initial[5] as usize];
+    // Version negotiation packet for a reserved version, echoing the client's connection IDs: an
+    // empty destination CID (the client's empty source CID) and the client's destination CID as
+    // the source
+    let mut vn = vec![0x80, 0, 0, 0, 0, 0, client_dcid.len() as u8];
+    vn.extend_from_slice(client_dcid);
+    vn.extend_from_slice(&hex!("0a1a2a3a"));
+    let opt_event = client.handle(now, server_addr, None, None, vn[..].into(), &mut buf);
     if let Some(DatagramEvent::ConnectionEvent(_, event)) = opt_event {
         client_ch.handle_event(event);
     }
@@ -1681,8 +1680,9 @@ fn migration() {
         pair.client.addr
     );
 
-    // Assert that the client's response to the PATH_CHALLENGE was an IMMEDIATE_ACK, instead of a
-    // second ping
+    // Assert that the client's response to each PATH_CHALLENGE (the second validating the path's
+    // MTU, the first held under 1200 bytes by anti-amplification) was an IMMEDIATE_ACK, instead
+    // of a second ping
     let client_stats_after_migrate = pair.client_conn_mut(client_ch).stats();
     assert_eq!(
         client_stats_after_migrate.frame_tx.ping - client_stats_after_connect.frame_tx.ping,
@@ -1691,7 +1691,7 @@ fn migration() {
     assert_eq!(
         client_stats_after_migrate.frame_tx.immediate_ack
             - client_stats_after_connect.frame_tx.immediate_ack,
-        1
+        2
     );
 }
 
